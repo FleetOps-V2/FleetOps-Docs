@@ -29,7 +29,11 @@ CloudCart is a production-style, containerized e-commerce platform built with a 
       │service  │ │service  │ │service  │ │service  │
       │:8080    │ │:8080    │ │:8080    │ │:8080    │
       └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘
-           │           │           │            │
+           │           │  ↕ cache  │            │
+           │      ┌────┴────┐      │            │
+           │      │  Redis  │      │            │
+           │      │  :6379  │      │            │
+           │      └─────────┘      │            │
            └───────────┴─────┬─────┴────────────┘
                              ▼
                  ┌────────────────────────┐
@@ -101,12 +105,9 @@ Docker Compose will:
 3. Start `order-service` (depends on product + cart being healthy)
 4. Start `frontend` last (depends on all four services being healthy)
 
-### 4. Seed the database (first run only)
+### 4. Database Seeding
 
-```bash
-# From cloudcart-infra directory:
-Get-Content database/seed.sql | docker exec -i cloudcart-postgres psql -U postgres -d product_db
-```
+The database is seeded **automatically** the first time the PostgreSQL container starts. You do not need to run any manual seed scripts.
 
 ### 5. Open the application
 
@@ -114,19 +115,20 @@ Get-Content database/seed.sql | docker exec -i cloudcart-postgres psql -U postgr
 http://localhost:8080
 ```
 
-### Default Admin Account
+### 👑 Creating the Admin Account
 
-The seed script does **not** create an admin user automatically. Create one via the register API, then promote via SQL:
+The automatic seed script does **not** create an admin user because passwords must be securely hashed by the API. To create your admin account, run these two commands from your terminal once the app is running:
 
+**1. Register a new user via the API:**
 ```bash
-# 1. Register a new user
-Invoke-RestMethod -Uri "http://localhost:8080/api/auth/register" `
-  -Method POST -ContentType "application/json" `
-  -Body '{"username":"cloudadmin","email":"admin@example.com","password":"Admin@123"}'
+curl -X POST http://localhost:8080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"cloudadmin","email":"admin@cloudcart.com","password":"Admin@123"}'
+```
 
-# 2. Promote to ADMIN role
-docker exec cloudcart-postgres psql -U postgres -d auth_db `
-  -c "UPDATE users SET role='ADMIN' WHERE username='cloudadmin';"
+**2. Promote the user to the ADMIN role directly in the database:**
+```bash
+docker exec cloudcart-postgres psql -U postgres -d auth_db -c "UPDATE users SET role='ADMIN' WHERE username='cloudadmin';"
 ```
 
 ---
@@ -178,13 +180,14 @@ docker exec cloudcart-postgres psql -U postgres -d auth_db `
 
 ---
 
-### 2. `cloudcart-product-service` — Product Catalog & Stock
+### 2. `cloudcart-product-service` — Product Catalog, Stock & Caching
 
 | Property       | Value                          |
 |----------------|-------------------------------|
-| Framework      | Spring Boot 3 + Spring Data JPA |
+| Framework      | Spring Boot 3.4 + Spring Data JPA |
 | Port (internal)| 8080                          |
 | Database       | `product_db` (PostgreSQL)     |
+| Cache          | Redis 7 (5-min TTL)           |
 | Exposed via    | `/api/products/*`             |
 
 #### Responsibilities
@@ -509,6 +512,8 @@ Admin users (role = `ADMIN`) have access to:
 | `POSTGRES_PASSWORD` | infra/all | `postgres` | Database password |
 | `DB_HOST` | all | `postgres` | Postgres container hostname |
 | `DB_PORT` | all | `5432` | Postgres port |
+| `REDIS_HOST` | product | `redis` | Redis container hostname |
+| `REDIS_PORT` | product | `6379` | Redis port |
 | `PRODUCT_SERVICE_URL` | order | `http://product-service:8080` | Internal product URL |
 | `CART_SERVICE_URL` | order | `http://cart-service:8080` | Internal cart URL |
 | `CORS_ALLOWED_ORIGINS` | all | `*` | CORS policy |
@@ -518,9 +523,9 @@ Admin users (role = `ADMIN`) have access to:
 ## 🐳 Docker Compose Startup Order
 
 ```
-postgres  ──healthy──►  auth-service   ──────────────────────────────────────────►┐
-                   ──►  product-service ──healthy──►  order-service ──healthy──►  frontend
-                   ──►  cart-service   ──healthy──►┘
+postgres  ──healthy──►  auth-service   ─────────────────────────────────────────────────►┐
+redis     ──healthy──►  product-service ──healthy──►  order-service ──healthy──►  frontend
+postgres  ──healthy──►  cart-service   ──healthy──►┘
 ```
 
 Each service uses `depends_on` with `condition: service_healthy`. Spring Boot services expose `/actuator/health` which is polled by Docker's healthcheck.
@@ -543,8 +548,8 @@ docker compose logs -f order-service
 # Check all container health
 docker compose ps
 
-# Seed products (first run)
-Get-Content database/seed.sql | docker exec -i cloudcart-postgres psql -U postgres -d product_db
+# Note: Seeding is automatic on first run. To force a re-seed, wipe volumes:
+# docker compose down -v && docker compose up -d
 
 # Access the database directly
 docker exec -it cloudcart-postgres psql -U postgres -d auth_db
@@ -620,6 +625,7 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/orders" `
 | Styling | Vanilla CSS with CSS variables (dark theme, glassmorphism) |
 | Backend | Spring Boot 3.4, Spring Security 6, Spring Data JPA |
 | Auth | JWT (HS512 via jjwt library) + BCrypt |
+| Cache | Redis 7-alpine (5-min TTL, graceful NoOp fallback) |
 | Database | PostgreSQL 15 |
 | ORM | Hibernate 6 |
 | Containerization | Docker, Docker Compose |
