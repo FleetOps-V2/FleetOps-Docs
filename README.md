@@ -364,14 +364,19 @@ order_items
 
 #### Frontend Routes
 
-| Route | Access | Description |
-|-------|--------|-------------|
-| `/` | Public | Home / landing page |
-| `/products` | Public | Product catalog grid |
-| `/login` | Public | Login + Register form |
-| `/checkout` | Auth required | Checkout (Buy Now or Cart mode) |
-| `/orders` | Auth required | Order history + Reorder |
-| `/admin` | ADMIN role only | Product management dashboard |
+| Route | Access | Who sees it | Description |
+|-------|--------|-------------|-------------|
+| `/` | Public | Everyone | Home / landing page |
+| `/products` | Public | Everyone | Product catalog grid |
+| `/login` | Public | Everyone | Login + Register form |
+| `/checkout` | CUSTOMER only | Logged-in customers | Checkout (Buy Now or Cart mode) |
+| `/orders` | CUSTOMER only | Logged-in customers | Order history + Reorder |
+| `/admin` | ADMIN only | Admin users | Product management dashboard |
+
+**Role-based UX rules:**
+- After login, **ADMIN** is redirected directly to `/admin`; **CUSTOMER** is redirected to `/products`
+- **Navbar:** ADMIN sees only `Admin` link. CUSTOMER sees `Orders` + `Cart`
+- **Product cards:** ADMIN sees a read-only `Stock: N` badge. CUSTOMER sees `Add to Cart` + `Buy Now` buttons
 
 #### Global State (`AppContext`)
 ```js
@@ -486,19 +491,35 @@ User → /orders page → click "Reorder" on past order item
 
 ---
 
-## 🛠️ Admin Capabilities
+## 🛠️ Admin vs Customer Experience
 
-Admin users (role = `ADMIN`) have access to:
+CloudCart enforces a strict role-based UX split so admin and customer flows never overlap.
+
+### Admin (role = `ADMIN`)
 
 | Feature | Location | Behavior |
 |---------|----------|---------|
+| Redirected after login | Auto | Goes to `/admin` directly, not `/products` |
 | View all products | `/admin` | Table with stock, price, last updated |
-| Stock adjustment | `/admin` → +10 / +50 buttons | Optimistic UI update + PATCH API call |
+| Stock adjustment | `/admin` → +10 / +50 | Optimistic UI update + PATCH API call |
 | Add new product | `/admin` → "+ Add Product" | Modal form |
 | Edit product | `/admin` → Edit button | Inline edit modal |
-| Delete product | `/admin` → Del button | Soft confirmation then DELETE API |
+| Delete product | `/admin` → Del button | Confirmation then DELETE API |
+| Product card view | `/products` | Shows **Stock: N** badge only — no buy buttons |
+| Navbar items | Everywhere | `Admin` link + username + Logout only |
 
-> Admin access is guarded both on the **frontend** (ProtectedRoute with `requireAdmin`) and the **backend** (Spring Security `hasRole("ADMIN")` on mutating product endpoints).
+### Customer (role = `CUSTOMER`)
+
+| Feature | Location | Behavior |
+|---------|----------|---------|
+| Redirected after login | Auto | Goes to `/products` |
+| Browse products | `/products` | Shows `Add to Cart` + `Buy Now` buttons |
+| Cart | Navbar Cart button | Slide-in drawer with items and subtotal |
+| Checkout | `/checkout` | Cart or Buy Now mode |
+| Order history | `/orders` | Past orders with product names, images, reorder |
+| Navbar items | Everywhere | `Orders` + `Cart` + username + Logout |
+
+> Access is enforced at **two levels:** the **frontend** (`ProtectedRoute` with `requireAdmin`, role checks in components) and the **backend** (Spring Security `hasRole("ADMIN")` on mutating product endpoints).
 
 ---
 
