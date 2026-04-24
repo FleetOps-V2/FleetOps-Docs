@@ -1,12 +1,12 @@
-# 🚛 FleetOps — Microservices Vehicle Maintenance Platform
+# FleetOps - Microservices Vehicle Maintenance Platform
 
-FleetOps is a production-style, containerized vehicle maintenance and fleet tracking platform built with a **microservices architecture**. It features a React SPA frontend served via NGINX, four independent Spring Boot backend services, a shared PostgreSQL instance with isolated databases per service, and JWT-based stateless authentication — all orchestrated with Docker Compose.
+FleetOps is a production-style, containerized vehicle maintenance and fleet tracking platform built with a **microservices architecture**. It features a React SPA frontend served via NGINX, four independent Spring Boot backend services, a shared PostgreSQL instance with isolated databases per service, and JWT-based stateless authentication - all orchestrated with Docker Compose.
 
 ---
 
-## 📐 Architecture Overview
+## Architecture Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        User's Browser                          │
 └─────────────────────────┬───────────────────────────────────┘
@@ -49,25 +49,25 @@ All services communicate on an internal **Docker bridge network** (`fleetops-net
 
 ---
 
-## 📦 Repository Structure
+## Repository Structure
 
-```
+```text
 Final Project/
-├── FleetOps-Docs/               ← Root README (this file)
-├── fleetops-frontend/           ← React + Vite SPA
-├── fleetops-auth-service/       ← Spring Boot: JWT auth + user management
-├── fleetops-vehicle-service/    ← Spring Boot: fleet tracking + KPIs
-├── fleetops-maintenance-service/← Spring Boot: pending tasks queue
-├── fleetops-request-service/    ← Spring Boot: service request workflows
-└── fleetops-infra/              ← Docker Compose + DB init scripts + seeds
+├── FleetOps-Docs/               <- Root README (this file)
+├── fleetops-frontend/           <- React + Vite SPA
+├── fleetops-auth-service/       <- Spring Boot: JWT auth + user management
+├── fleetops-vehicle-service/    <- Spring Boot: fleet tracking + KPIs
+├── fleetops-maintenance-service/<- Spring Boot: pending tasks queue
+├── fleetops-request-service/    <- Spring Boot: service request workflows
+└── fleetops-infra/              <- Docker Compose + DB init scripts + seeds
 ```
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (v4+)
+- Docker Desktop (v4+)
 - Docker Compose v2
 
 ### 1. Configure environment
@@ -75,7 +75,7 @@ Final Project/
 ```bash
 cd fleetops-infra
 cp .env.example .env
-# Edit .env — at minimum set JWT_SECRET to any long random string
+# Edit .env - at minimum set JWT_SECRET to any long random string
 ```
 
 **Minimum `.env` content:**
@@ -89,7 +89,7 @@ POSTGRES_PASSWORD=postgres
 
 ```bash
 cd fleetops-infra
-docker compose up --build -d
+docker-compose up --build -d
 ```
 
 Docker Compose will:
@@ -100,28 +100,26 @@ Docker Compose will:
 
 ### 3. Database Seeding
 
-The database is seeded **automatically** the first time the PostgreSQL container starts. You do not need to run any manual seed scripts. It creates 21 test vehicles (Sedans, SUVs, Trucks) and 3 test users (`driver1`, `manager1`, `admin1`).
+The database is seeded **automatically** the first time the PostgreSQL container starts. You do not need to run any manual seed scripts. It creates 21 test vehicles (Sedans, SUVs, Trucks) and default test users (`admin1`, `manager1`, `driver1`, `driver2`, `driver3`).
 
 ### 4. Open the application
 
-```
+```text
 http://localhost:8080
 ```
 
-### 👑 Testing the Accounts
+### Testing the Accounts
 
-The automatic seed script creates three users for testing role-based access:
-- **Admin**: `admin1 / admin123` (Full Fleet CRUD)
-- **Manager**: `manager1 / manager123` (KPI Dashboard & Request Approvals)
-- **Driver**: `driver1 / driver123` (View assigned vehicles & log maintenance)
-
----
-
-## 🔑 Service Details
+The automatic seed script creates default users for testing role-based access:
+- **Admin**: `admin1 / Admin@123` (Full Fleet CRUD)
+- **Manager**: `manager1 / Manager@123` (KPI Dashboard & Request Approvals)
+- **Driver**: `driver1 / Driver@123` (also `driver2`, `driver3` with `Driver@123`) (View assigned vehicles & log maintenance)
 
 ---
 
-### 1. `fleetops-auth-service` — Authentication & Authorization
+## Service Details
+
+### 1. `fleetops-auth-service` - Authentication & Authorization
 
 | Property       | Value                          |
 |----------------|-------------------------------|
@@ -131,9 +129,9 @@ The automatic seed script creates three users for testing role-based access:
 | Exposed via    | `/api/auth/*`                 |
 
 #### Responsibilities
-- **User registration** — stores BCrypt-hashed passwords
-- **User login** — validates credentials, issues HS512 JWT tokens
-- **Role management** — `DRIVER`, `MANAGER`, and `ADMIN`
+- **User registration** - stores BCrypt-hashed passwords
+- **User login** - validates credentials, issues HS512 JWT tokens
+- **Role management** - `DRIVER`, `MANAGER`, and `ADMIN`
 
 #### Key Endpoints
 
@@ -145,7 +143,7 @@ The automatic seed script creates three users for testing role-based access:
 
 ---
 
-### 2. `fleetops-vehicle-service` — Fleet Lifecycle & Alerts
+### 2. `fleetops-vehicle-service` - Fleet Lifecycle & Alerts
 
 | Property       | Value                          |
 |----------------|-------------------------------|
@@ -172,7 +170,7 @@ The automatic seed script creates three users for testing role-based access:
 
 ---
 
-### 3. `fleetops-maintenance-service` — Pending Task Staging
+### 3. `fleetops-maintenance-service` - Pending Task Staging
 
 | Property       | Value                          |
 |----------------|-------------------------------|
@@ -196,7 +194,7 @@ The automatic seed script creates three users for testing role-based access:
 
 ---
 
-### 4. `fleetops-request-service` — Service Request Workflow
+### 4. `fleetops-request-service` - Service Request Workflow
 
 | Property       | Value                          |
 |----------------|-------------------------------|
@@ -217,12 +215,12 @@ The automatic seed script creates three users for testing role-based access:
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `POST` | `/requests/place` | JWT | Formalize queued tasks into Service Requests |
-| `GET` | `/requests` | JWT | Get current user's request history or all requests (Manager/Admin) |
+| `GET` | `/requests` | JWT | Get current user's request history |
 | `PATCH` | `/requests/{id}/status` | MANAGER/ADMIN | Progress request state |
 
 ---
 
-### 5. `fleetops-frontend` — React SPA
+### 5. `fleetops-frontend` - React SPA
 
 | Property       | Value                          |
 |----------------|-------------------------------|
@@ -250,19 +248,9 @@ The automatic seed script creates three users for testing role-based access:
 - **Manager**: Auto-redirects to `/dashboard`. Can approve/manage requests.
 - **Driver**: Auto-redirects to `/vehicles`. Can create tasks for their assigned vehicles.
 
-#### Global State (`AppContext`)
-```js
-{
-  isAuthenticated: boolean,
-  username: string,
-  role: "DRIVER" | "MANAGER" | "ADMIN",
-  taskItemsCount: number
-}
-```
-
 ---
 
-## 🗄️ Database Strategy
+## Database Strategy
 
 All four services share **one PostgreSQL 15 container** but use completely **isolated databases**. The init script runs on first container startup:
 
@@ -278,13 +266,13 @@ Each service connects to its own database via `SPRING_DATASOURCE_URL`. Hibernate
 
 ---
 
-## 🔒 Security Model
+## Security Model
 
-**JWT secret is shared** across all services via the `JWT_SECRET` environment variable. Each service independently validates tokens — no dedicated API gateway or token introspection service is needed. `hasRole()` checks are placed on all mutating backend endpoints.
+**JWT secret is shared** across all services via the `JWT_SECRET` environment variable. Each service independently validates tokens - no dedicated API gateway or token introspection service is needed. `hasRole()` checks are placed on all mutating backend endpoints.
 
 ---
 
-## 🛠️ Tech Stack Summary
+## Tech Stack Summary
 
 | Layer | Technology |
 |-------|-----------|
@@ -301,4 +289,4 @@ Each service connects to its own database via `SPRING_DATASOURCE_URL`. Hibernate
 
 ---
 
-*FleetOps — A modern microservices vehicle tracking and maintenance platform.*
+*FleetOps - A modern microservices vehicle tracking and maintenance platform.*
