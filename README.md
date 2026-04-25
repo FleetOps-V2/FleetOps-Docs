@@ -289,4 +289,53 @@ Each service connects to its own database via `SPRING_DATASOURCE_URL`. Hibernate
 
 ---
 
+## Kubernetes Deployment (kgateway Ingress)
+
+FleetOps supports a fully native Kubernetes deployment using **kgateway** (Gateway API) for traffic routing, separated into `fleetops-dev` and `fleetops-prod` environments.
+
+### 1. Install kgateway
+First, install the Gateway API CRDs and kgateway into your cluster:
+
+```bash
+# Install standard Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+
+# Install kgateway using Helm
+helm repo add kgateway https://kgateway.dev/charts
+helm repo update
+helm install kgateway kgateway/kgateway \
+  --namespace kgateway-system \
+  --create-namespace
+```
+
+### 2. Apply Platform Resources
+Apply the platform-level Gateway definition:
+
+```bash
+kubectl apply -f fleetops-deployments/k8s/platform/namespace.yaml
+kubectl apply -f fleetops-deployments/k8s/platform/gateway.yaml
+```
+
+### 3. Deploy Environments
+Deploy the databases and applications for your desired environment (e.g., `dev`):
+
+```bash
+kubectl apply -f fleetops-deployments/k8s/dev/namespace.yaml
+
+# Deploy Databases & Secrets first
+kubectl apply -f fleetops-deployments/k8s/dev/database/
+
+# Deploy Applications & Routing
+kubectl apply -f fleetops-deployments/k8s/dev/apps/
+```
+
+### 4. Access the Platform
+The environment is routed using `nip.io` hostnames based on your instance's IP.
+- **Dev URL:** `http://dev.98.86.98.79.nip.io`
+- **Prod URL:** `http://prod.98.86.98.79.nip.io`
+
+*Note: You can verify the gateway IP by running `kubectl get svc -n kgateway-system`.*
+
+---
+
 *FleetOps - A modern microservices vehicle tracking and maintenance platform.*
