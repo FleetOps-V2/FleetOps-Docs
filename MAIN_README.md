@@ -1,120 +1,79 @@
-# 🚚 FleetOps Enterprise — Vehicle Maintenance & Fleet Tracking
+# FleetOps V2 — Enterprise Fleet Management Platform
 
-FleetOps is a production-grade, containerized vehicle maintenance and fleet tracking platform built with a **microservices architecture**. It features a modern React SPA frontend served via Nginx, four independent Spring Boot backend services, a shared PostgreSQL instance with service-isolated databases, Redis-based fleet lifecycle caching, and JWT stateless authentication.
+FleetOps V2 is a production-grade fleet maintenance and vehicle tracking platform deployed on AWS EKS using a full GitOps pipeline. It consists of four Spring Boot microservices, a React frontend, AI-powered maintenance advisory via Amazon Bedrock, and a fully automated CI/CD pipeline from code push to production.
 
-This repository represents a fully operational development and staging environment that has passed all verification audits.
+**Live URL:** https://fleetops.website  
+**ArgoCD Dashboard:** https://argocd.fleetops.website  
+**AWS Account:** 538661800892 (us-east-1)
 
 ---
 
-## 📂 Repository Structure
+## Repository Map
 
-```text
-d:\UST Training\Fleetops-V2/
-├── README.md                      <-- Root portal (this file)
-├── FleetOps-Docs/                 <-- Detailed Documentation Hub
-│   ├── ARCHITECTURE.md            <-- Core Architecture, Schemas & Audit Report
-│   ├── DEPLOYMENT_AWS.md          <-- Step-by-Step EC2 & ECS AWS Provisioning Guide
-│   ├── AI_INTEGRATION.md          <-- Amazon Bedrock AI Co-Pilot Blueprint
-│   └── ROADMAP.md                 <-- Multi-Phase Delivery Roadmap
-├── fleetops-frontend/             <-- React SPA + Vite Dev Proxy
-├── fleetops-auth-service/         <-- Spring Boot: User Auth & JWT Issuer
-├── fleetops-vehicle-service/      <-- Spring Boot: Fleet Management & Redis Cache
-├── fleetops-maintenance-service/  <-- Spring Boot: Pending Task Queue Staging
-├── fleetops-request-service/      <-- Spring Boot: Service Request State Machine
-└── fleetops-infra/                <-- Docker Compose orchestration & Nginx Gateway
+```
+FleetOps-V2/
+├── fleetops-frontend/              React SPA (Vite + TypeScript)
+├── fleetops-auth-service/          Spring Boot — JWT auth, user management
+├── fleetops-vehicle-service/       Spring Boot — fleet management, Bedrock AI advisor
+├── fleetops-maintenance-service/   Spring Boot — scheduled maintenance, SNS alerts
+├── fleetops-request-service/       Spring Boot — service requests, Step Functions
+├── fleetops-terraform/             All AWS infrastructure as code
+├── fleetops-deployments/           Kubernetes manifests + ArgoCD app definitions
+├── fleetops-github-workflows/      Shared reusable CI/CD workflow templates
+└── FleetOps-Docs/                  This documentation hub
 ```
 
 ---
 
-## ⚡ Platform Status & Audit Results
+## Documentation Index
 
-Following the final system audit, the FleetOps platform is **fully operational** with all components healthy and communicating.
-
-*   **Status:** `✅ FULLY OPERATIONAL`
-*   **Total Audit Tests:** `33 / 33 PASSED`
-*   **CORS & Routing:** Resolved via local dev proxy configuration and Nginx gateway.
-
-| Service | Container Name | Technology | Port (Internal) | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **API Gateway** | `fleetops-gateway` | Nginx Alpine | `8080` (Host Exposure) | ✅ Healthy |
-| **Auth Service** | `fleetops-auth-service` | Spring Boot 3 + Security 6 | `8080` | ✅ Healthy |
-| **Vehicle Service** | `fleetops-vehicle-service` | Spring Boot 3 + Redis Cache | `8080` | ✅ Healthy |
-| **Request Service** | `fleetops-request-service` | Spring Boot 3 + RestTemplate | `8080` | ✅ Healthy |
-| **Maintenance Service** | `fleetops-maintenance-service` | Spring Boot 3 | `8080` | ✅ Healthy |
-| **Database** | `fleetops-postgres` | PostgreSQL 15 | `5432` | ✅ Healthy |
-| **Cache Store** | `fleetops-redis` | Redis 7 | `6379` | ✅ Healthy |
+| Document | What It Covers |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Full system architecture — EKS, GitOps, AWS services, data flow |
+| [DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md) | How to deploy, CI/CD pipeline, day-of-eval apply steps |
+| [AI_INTEGRATION.md](AI_INTEGRATION.md) | Amazon Bedrock Fleet Maintenance Advisor — live implementation |
 
 ---
 
-## 🔑 Demo Access Credentials
+## Platform at a Glance
 
-The database seeds automatically on first container launch. The platform enforces **Role-Based Access Control (RBAC)** across the following preconfigured test accounts:
-
-| Role | Username | Password | Default Landing Page | Permissions |
-| :--- | :--- | :--- | :--- | :--- |
-| **Admin** | `admin1` | `Admin@123` | `/admin` | Full CRUD operations, Fleet Admin catalog, cache monitor. |
-| **Manager** | `manager1` | `Manager@123` | `/dashboard` | View fleet KPI dashboard, review and approve service requests. |
-| **Driver** | `driver1` | `Driver@123` | `/vehicles` | View assigned vehicle status, draft maintenance items. |
-| **Driver** | `driver2` | `Driver@123` | `/vehicles` | View assigned vehicle status, draft maintenance items. |
-| **Driver** | `driver3` | `Driver@123` | `/vehicles` | View assigned vehicle status, draft maintenance items. |
-
----
-
-## 🚀 Local Quick Start (Docker Compose)
-
-### Prerequisites
-*   Docker Desktop (v4+)
-*   Docker Compose v2
-
-### 1. Initialize Configuration
-Navigate to the infrastructure directory and copy the environment template:
-```bash
-cd fleetops-infra
-cp .env.example .env
-```
-Edit the `.env` file and set the JWT secret (must be a secure string of at least 32 characters):
-```env
-JWT_SECRET=mySuperSecureJWTSecretMustBeAtLeast32CharactersLong
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-```
-
-### 2. Build & Launch Containers
-Spin up the entire microservices network in background mode:
-```bash
-docker-compose up --build -d
-```
-Docker Compose will automatically resolve service dependencies:
-1. Start `fleetops-postgres` and `fleetops-redis` databases.
-2. Spin up `auth-service`, `vehicle-service`, and `maintenance-service` once databases report healthy.
-3. Boot `request-service` once both vehicle and maintenance services are healthy.
-4. Execute `frontend` builder and launch Nginx `fleetops-gateway` to expose the app.
-
-### 3. Access the Application
-*   **Web Portal:** [http://localhost:8080](http://localhost:8080)
-*   **Health Dashboard:** Navigate to [http://localhost:8080/health/auth](http://localhost:8080/health/auth) to check service health actuator responses (replace `/auth` with `/vehicles`, `/requests`, or `/maintenance` to inspect specific services).
+| Layer | Technology |
+|---|---|
+| Frontend | React 18 + Vite + TypeScript, served via Nginx on EKS |
+| Backend | 4 x Spring Boot 3.x microservices |
+| Database | Amazon RDS PostgreSQL 15 (multi-schema, one instance) |
+| Cache | Amazon ElastiCache Redis 7 |
+| Container Orchestration | Amazon EKS 1.31 (managed node groups, m7i-flex.large) |
+| GitOps | ArgoCD v2 (App-of-Apps pattern) |
+| Infrastructure as Code | Terraform (modular, remote state on S3 + DynamoDB lock) |
+| CI/CD | GitHub Actions with OIDC — no static AWS keys in pipelines |
+| Secret Management | AWS Secrets Manager + SSM via External Secrets Operator (ESO) |
+| AI Advisory | Amazon Bedrock (Claude 3 Haiku via Converse API) |
+| CDN & Security | Amazon CloudFront + AWS WAF v2 |
+| DNS & TLS | Route 53 + ACM wildcard certificate (*.fleetops.website) |
+| Workflow Automation | AWS Step Functions (service request state machine) |
+| Alerting | Amazon SNS (insurance expiry + service overdue notifications) |
+| Scheduled Jobs | Amazon EventBridge (daily fleet maintenance scan) |
+| Audit & Compliance | AWS CloudTrail, AWS Config, VPC Flow Logs, KMS encryption |
 
 ---
 
-## 📖 Deep-Dive Manuals
+## Services
 
-To continue onto production deployment and advanced features, please refer to our dedicated documentation modules:
-
-1.  **[Core Architecture & System Audit](./FleetOps-Docs/ARCHITECTURE.md)**
-    *   Detailed service communication maps and JSON request flows.
-    *   Database schemas and relationships.
-    *   Complete list of the 33 audit test specs and details of bugs resolved.
-2.  **[AWS Production Provisioning Guide](./FleetOps-Docs/DEPLOYMENT_AWS.md)**
-    *   Step-by-step setup for AWS RDS PostgreSQL (isolated schemas), ElastiCache Redis, and Secrets Manager.
-    *   EC2 Docker Compose single-instance staging guide.
-    *   ECS Fargate multi-service production architecture guide.
-3.  **[Amazon Bedrock AI Co-Pilot Blueprint](./FleetOps-Docs/AI_INTEGRATION.md)**
-    *   Architecture flow for integrating LLM diagnostics.
-    *   Spring Boot integration code using the AWS Bedrock runtime SDK.
-    *   Prompt templates, IAM permission definitions, and React SPA chat UI mockups.
-4.  **[Multi-Phase Project Roadmap](./FleetOps-Docs/ROADMAP.md)**
-    *   Structured gantt roadmap mapping subsequent sprint goals.
-    *   Step-by-step phases covering staging refinement, ECS production deployments, Bedrock AI releases, and real-time operations.
+| Service | Key Responsibility |
+|---|---|
+| `fleetops-auth-service` | JWT issuance, user registration/login, ROLE_ADMIN / ROLE_MANAGER / ROLE_DRIVER |
+| `fleetops-vehicle-service` | Vehicle CRUD, fleet health scoring, Redis cache, Bedrock AI advisor |
+| `fleetops-maintenance-service` | Maintenance task lifecycle, EventBridge-triggered scans, SNS alerts |
+| `fleetops-request-service` | Service request creation and tracking, Step Functions state machine |
+| `fleetops-frontend` | React SPA — dashboard, fleet view, AI advisor panel, request management |
 
 ---
-*FleetOps Enterprise — A Modern Vehicle Lifecycle Management Suite.*
+
+## Key Design Decisions
+
+- **No static AWS credentials anywhere** — all pods use IRSA (IAM Roles for Service Accounts); CI/CD uses OIDC
+- **No secrets in Git** — all secrets live in AWS Secrets Manager and are injected at runtime via ESO
+- **GitOps-only deployments** — no `kubectl apply` by hand; ArgoCD owns cluster state
+- **Single ALB shared** — all Ingresses use `group.name: fleetops` so one ALB serves all services with host-based routing
+- **CloudFront in front of everything** — users never hit the ALB directly; CloudFront adds WAF, caching, and HTTPS termination

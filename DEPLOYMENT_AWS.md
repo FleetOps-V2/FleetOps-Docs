@@ -1,304 +1,273 @@
-# ☁️ AWS Production Provisioning & Deployment Guide
-
-This guide details the step-by-step instructions to deploy the FleetOps microservices platform to Amazon Web Services (AWS). It covers networking, managed database provisioning, container registries, and two deployment pathways:
-1.  **Staging Deployments:** A single-instance EC2 runner running Docker Compose.
-2.  **Production Deployments:** A highly-available, serverless AWS ECS Fargate cluster behind an Application Load Balancer.
+# FleetOps V2 — Deployment Guide
 
 ---
 
-## 🏗️ Target AWS Architecture
+## Prerequisites
 
-```text
-                             [ Client Browser ]
-                                     │ HTTPS (Port 443)
-                                     ▼
-                      [ Amazon Route 53 (DNS) ]
-                                     │
-                                     ▼
-                  [ AWS Certificate Manager (ACM SSL) ]
-                                     │
-                                     ▼
-                [ Application Load Balancer (ALB) :80/443 ]
-                                     │
-            ┌────────────────┬───────┴────────┬────────────────┐
-            │ /api/auth/*    │ /api/vehicles/*│ /api/tasks/*   │ /api/requests/*
-            ▼                ▼                ▼                ▼
-   ┌────────────────┐┌────────────────┐┌────────────────┐┌────────────────┐
-   │ ECS Task       ││ ECS Task       ││ ECS Task       ││ ECS Task       │
-   │ (Auth Service) ││(Vehicle Service││(Maint. Service)││(Request Service│
-   └────────┬───────┘└───────┬────────┘└───────┬────────┘└───────┬────────┘
-            │                │                 │                 │
-            │                │                 │                 │
-            │                │                 │                 │
-            ▼                ▼                 ▼                 ▼
-   ┌──────────────────────────────────────────────────────────────────────┐
-   │                     AWS Private Database Subnets                     │
-   │                                                                      │
-   │   ┌───────────────────────────────┐     ┌────────────────────────┐   │
-   │   │     Amazon RDS PostgreSQL     │     │ Amazon ElastiCache     │   │
-   │   │  (Multi-AZ, Port 5432)        │     │ (Redis Cluster, :6379) │   │
-   │   └───────────────────────────────┘     └────────────────────────┘   │
-   └──────────────────────────────────────────────────────────────────────┘
-```
+| Tool | Version | Purpose |
+|---|---|---|
+| Terraform | >= 1.9 | Infrastructure provisioning |
+| AWS CLI | >= 2.x | AWS authentication |
+| kubectl | >= 1.28 | Cluster management |
+| helm | >= 3.x | Chart management |
+| git | any | Source control |
+
+AWS credentials must have sufficient permissions to create EKS, RDS, VPC, IAM, and all related resources. The CI/CD pipeline uses OIDC — no static keys needed in GitHub.
 
 ---
 
-## 🛠️ Step 1: Network Infrastructure (VPC)
+## GitHub Secrets Required
 
-Create a custom Virtual Private Cloud (VPC) to isolate backend resources from direct internet access.
+These must be set in the GitHub organization or per-repo before any pipeline can run:
 
-1.  **Create VPC:**
-    *   **Name:** `fleetops-vpc`
-    *   **IPv4 CIDR Block:** `10.0.0.0/16`
-2.  **Provision Subnets:** Create subnets across two Availability Zones (e.g., `us-east-1a` and `us-east-1b`) for high availability:
-    *   **Public Subnet A:** `10.0.1.0/24` (AZ: `us-east-1a` — for ALB / Gateway)
-    *   **Public Subnet B:** `10.0.2.0/24` (AZ: `us-east-1b` — for ALB / Gateway)
-    *   **Private App Subnet A:** `10.0.10.0/24` (AZ: `us-east-1a` — for EC2 / ECS Tasks)
-    *   **Private App Subnet B:** `10.0.11.0/24` (AZ: `us-east-1b` — for EC2 / ECS Tasks)
-    *   **Private DB Subnet A:** `10.0.20.0/24` (AZ: `us-east-1a` — for RDS & Redis)
-    *   **Private DB Subnet B:** `10.0.21.0/24` (AZ: `us-east-1b` — for RDS & Redis)
-3.  **Configure Routing:**
-    *   Create an **Internet Gateway (IGW)** and attach it to `fleetops-vpc`.
-    *   Create **NAT Gateways** in the Public Subnets to allow private subnet services to pull updates or communicate downstream.
-    *   Configure route tables to map public subnets to the IGW, and private subnets to the NAT Gateways.
+| Secret Name | Value |
+|---|---|
+| `AWS_ACCOUNT_ID` | `538661800892` |
+| `AWS_REGION` | `us-east-1` |
+| `GITHUB_PAT_FOR_DEPLOYMENTS` | Personal Access Token with `repo` scope (for pushing to fleetops-deployments) |
+| `ARGOCD_SERVER` | `argocd.fleetops.website` |
+| `ARGOCD_AUTH_TOKEN` | ArgoCD API token for syncing apps from pipeline |
 
 ---
 
-## 🗄️ Step 2: Database Provisioning (Amazon RDS PostgreSQL)
+## First-Time Deployment (Bootstrap Sequence)
 
-Configure a production-grade relational database instead of running local database containers.
+### Step 1 — Bootstrap Terraform Remote State
 
-1.  **Create Subnet Group:** Navigate to the RDS Console, select **Subnet Groups**, and create a group named `fleetops-rds-subnet-group` containing `Private DB Subnet A` and `Private DB Subnet B`.
-2.  **Create Security Group:** Create `fleetops-rds-sg`:
-    *   **Inbound Rule:** Allow TCP on port `5432` from the app security group (`fleetops-app-sg`).
-3.  **Launch Database:**
-    *   **Engine:** PostgreSQL (version 15.x recommended)
-    *   **Template:** Dev/Test (or Production with Multi-AZ enabled)
-    *   **DB Instance Identifier:** `fleetops-db-postgres`
-    *   **Master Username:** `fleetops_master`
-    *   **Master Password:** Generate a secure password.
-    *   **DB Subnet Group:** Select `fleetops-rds-subnet-group`.
-    *   **Public Access:** No.
-    *   **Security Group:** Select `fleetops-rds-sg`.
-4.  **Create Isolated Databases:** Once RDS is active, connect via a jump box in the public subnet and run:
-    ```sql
-    CREATE DATABASE auth_db;
-    CREATE DATABASE vehicle_db;
-    CREATE DATABASE maintenance_db;
-    CREATE DATABASE request_db;
-    ```
+The S3 bucket and DynamoDB table for Terraform state must exist before anything else.
 
----
-
-## ⚡ Step 3: Cache Cluster Provisioning (Amazon ElastiCache Redis)
-
-Provision a managed Redis cache to replace the internal Docker Redis container.
-
-1.  **Create Subnet Group:** Create an ElastiCache subnet group named `fleetops-redis-subnet-group` referencing `Private DB Subnet A` and `Private DB Subnet B`.
-2.  **Create Security Group:** Create `fleetops-redis-sg`:
-    *   **Inbound Rule:** Allow TCP on port `6379` from the app security group (`fleetops-app-sg`).
-3.  **Launch Cluster:**
-    *   **Engine:** Redis OSS
-    *   **Node Type:** `cache.t4g.micro` (or larger depending on traffic)
-    *   **Number of Replicas:** 0 (Staging) or 1 (Production Multi-AZ)
-    *   **Subnet Group:** Select `fleetops-redis-subnet-group`.
-    *   **Security Group:** Select `fleetops-redis-sg`.
-    *   Take note of the Primary Endpoint (e.g., `fleetops-redis.xxxx.cache.amazonaws.com`).
-
----
-
-## 🔒 Step 4: AWS Secrets Manager Setup
-
-Store database passwords and JWT secrets securely to avoid committing plain-text keys to task definitions.
-
-1.  **Create Secret:** Create a secret named `fleetops/production/config`.
-2.  **Add Key/Value Pairs:**
-    *   `JWT_SECRET` = (Generate a 64-character random string)
-    *   `POSTGRES_USER` = `fleetops_master`
-    *   `POSTGRES_PASSWORD` = (Your RDS master password)
-    *   `DB_HOST` = (Your RDS PostgreSQL Endpoint)
-    *   `REDIS_HOST` = (Your ElastiCache Primary Endpoint)
-
----
-
-## 📦 Step 5: AWS Elastic Container Registry (ECR) Setup
-
-Prepare the cloud container registry to host individual microservice images.
-
-1.  **Create ECR Repositories:** Run these commands using the AWS CLI:
-    ```bash
-    aws ecr create-repository --repository-name fleetops-auth-service
-    aws ecr create-repository --repository-name fleetops-vehicle-service
-    aws ecr create-repository --repository-name fleetops-maintenance-service
-    aws ecr create-repository --repository-name fleetops-request-service
-    aws ecr create-repository --repository-name fleetops-gateway
-    ```
-2.  **Build & Push Images:** Build the production Docker images locally or via CI/CD, tag them, and push them to ECR:
-    ```bash
-    # Authenticate Docker to ECR (replace AWS account id and region)
-    aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
-
-    # Build and Push Auth Service
-    cd fleetops-auth-service
-    docker build -t fleetops-auth-service .
-    docker tag fleetops-auth-service:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/fleetops-auth-service:latest
-    docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/fleetops-auth-service:latest
-    ```
-    Repeat this build-tag-push flow for all 4 services and the Nginx gateway.
-
----
-
-## 🛠️ Step 6: EC2 Deployment Guide (Staging / Cost-Effective Option)
-
-To run the system on a single virtual server (EC2 instance) using Docker Compose (ideal for cost-effective development, user testing, or staging):
-
-### 1. Launch the EC2 Instance
-*   **AMI:** Ubuntu Server 22.04 LTS or Amazon Linux 2023.
-*   **Instance Type:** `t3.medium` (2 vCPUs, 4GB RAM — needed to support 5 Java containers + Nginx).
-*   **Network:** `fleetops-vpc` -> `Public Subnet A`. Enable public IP auto-assignment.
-*   **Security Group (`fleetops-ec2-sg`):**
-    *   Inbound TCP port `22` (SSH) from your IP.
-    *   Inbound TCP port `8080` (API Gateway) from Anywhere (`0.0.0.0/0`).
-*   **IAM Role:** Attach an IAM Role with the `AmazonEC2ContainerRegistryReadOnly` and `SecretsManagerReadWrite` policy permissions.
-
-### 2. Configure the EC2 Host
-Connect to the server via SSH and install Docker and Git:
 ```bash
-sudo apt-get update -y
-sudo apt-get install -y docker.io git jq
-sudo systemctl enable --now docker
-sudo usermod -aG docker ubuntu
-# Log out and log back in to apply group membership
+cd fleetops-terraform/bootstrap/
+terraform init
+terraform apply
 ```
 
-### 3. Deploy the Compose Application
-Clone the repository, fetch the credentials from Secrets Manager, write them to `.env`, and start the containers:
+This creates:
+- S3 bucket: `fleetops-prod-terraform-state`
+- DynamoDB table: `fleetops-prod-terraform-locks`
+
+### Step 2 — Deploy All Infrastructure
+
 ```bash
-# Clone source code
-git clone <your-git-repo-url> fleetops
-cd fleetops/fleetops-infra
+cd fleetops-terraform/environments/prod/
+terraform init
+terraform plan -out=tfplan
+terraform apply tfplan
+```
 
-# Authenticate Docker with AWS ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+This takes approximately 20–30 minutes. It creates:
+- VPC, subnets, NAT gateway
+- EKS cluster + managed node group
+- RDS PostgreSQL (encrypted)
+- ElastiCache Redis
+- ACM certificate (DNS-validated via Route53)
+- CloudFront distribution
+- WAF, CloudTrail, Config
+- IAM roles (IRSA, GitHub Actions OIDC)
+- Secrets Manager secrets
+- ArgoCD root Application (via `kubernetes_manifest` resource)
 
-# Fetch secrets and write to .env file
-aws secretsmanager get-secret-value --secret-id fleetops/production/config --query SecretString --output text | jq -r 'to_entries|map("\(.key)=\(.value)")|.[]' > .env
+### Step 3 — Update ALB DNS
 
-# Inject cloud database endpoints into .env
-echo "DB_HOST=fleetops-db-postgres.xxxxxx.us-east-1.rds.amazonaws.com" >> .env
-echo "REDIS_HOST=fleetops-redis.xxxxxx.cache.amazonaws.com" >> .env
-echo "DB_PORT=5432" >> .env
+After apply completes, the ALB DNS name is output. Update `prod.auto.tfvars`:
 
-# Edit docker-compose.yml to point image fields to ECR instead of local builds:
-# Example: image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/fleetops-auth-service:latest
+```hcl
+origin_alb_dns = "k8s-fleetops-XXXXXXXX.us-east-1.elb.amazonaws.com"
+```
 
-# Build and run
-docker compose up -d
+Run `terraform apply` again — this creates the Route53 alias records for `origin.fleetops.website` and `argocd.fleetops.website`.
+
+### Step 4 — Update Domain Nameservers
+
+After Route53 creates the hosted zone, get the nameservers:
+
+```bash
+aws route53 list-resource-record-sets \
+  --hosted-zone-id <ZONE_ID> \
+  --query "ResourceRecordSets[?Type=='NS'].ResourceRecords[*].Value" \
+  --output text
+```
+
+Update your domain registrar to point `fleetops.website` to these 4 nameservers. DNS propagation takes 5–30 minutes.
+
+### Step 5 — Trigger Service Deployments
+
+Push any trivial change to each service repo (or manually trigger the GitHub Actions workflow). This builds Docker images, pushes to ECR, and updates the image tag in `fleetops-deployments`. ArgoCD then deploys each service automatically.
+
+After all pipelines complete:
+
+```bash
+kubectl get applications -n argocd
+# All 11 apps should be: Synced + Healthy
+
+kubectl get pods -n fleetops-prod
+# All pods should be: 1/1 Running
 ```
 
 ---
 
-## 🚀 Step 7: Production Deployments using AWS ECS Fargate
+## Eval Day Apply (Destroy → Recreate)
 
-For production, deploy the containers serverlessly using Amazon ECS Fargate, removing EC2 cluster management overhead.
+After a `terraform destroy`, follow this sequence on eval day:
 
-### 1. Create ECS Cluster
-Navigate to ECS, and click **Create Cluster**:
-*   **Cluster Name:** `fleetops-production`
-*   **Infrastructure:** AWS Fargate (Serverless)
+### 1. Apply infrastructure (~25 min)
+```bash
+cd fleetops-terraform/environments/prod/
+terraform apply -auto-approve
+```
 
-### 2. Create Task Definitions
-Create a Task Definition for each of the 4 microservices. The configuration for **Auth Service** is outlined below:
-*   **Task Definition Name:** `fleetops-auth-task`
-*   **Infrastructure Requirements:**
-    *   Operating System/Architecture: Linux/ARM64 or X86_64
-    *   Task Size: `0.5 vCPU` and `1 GB RAM` (sufficient for JVM operation)
-*   **Task Role & Task Execution Role:** Select standard ECS role with policies enabling:
-    *   Read access to ECR repositories.
-    *   Read access to Secrets Manager (`fleetops/production/config`).
-    *   Write access to CloudWatch Logs (`logs:CreateLogStream`, `logs:PutLogEvents`).
-*   **Container Declarations:**
-    *   **Name:** `auth-service`
-    *   **Image:** `123456789012.dkr.ecr.us-east-1.amazonaws.com/fleetops-auth-service:latest`
-    *   **Port Mappings:** Container Port: `8080`, Protocol: TCP.
-    *   **Environment Variables:**
-        *   Retrieve values from Secrets Manager keys dynamically:
-            *   `SPRING_DATASOURCE_URL` = `jdbc:postgresql://<secrets_manager_DB_HOST>:5432/auth_db`
-            *   `SPRING_DATASOURCE_USERNAME` = Ref `POSTGRES_USER`
-            *   `SPRING_DATASOURCE_PASSWORD` = Ref `POSTGRES_PASSWORD`
-            *   `JWT_SECRET` = Ref `JWT_SECRET`
-        *   Hardcoded Variables:
-            *   `SPRING_PROFILES_ACTIVE` = `prod` (deactivates developer seeding)
-            *   `JAVA_OPTS` = `-Xms256m -Xmx512m`
-    *   **Log Configuration:** Enable awslogs utility, mapping output to a CloudWatch log group named `/ecs/fleetops-auth-service`.
+### 2. Get the new ALB DNS
+```bash
+terraform output -raw alb_dns_name
+# or check: kubectl get ingress -n fleetops-prod
+```
 
-Repeat this task configuration for:
-*   `vehicle-service` (linking `REDIS_HOST` dynamically).
-*   `maintenance-service` (database link).
-*   `request-service` (linking `VEHICLE_SERVICE_URL` and `MAINTENANCE_SERVICE_URL` to their internal Service Discovery endpoints).
+### 3. Update origin_alb_dns in prod.auto.tfvars
+```hcl
+origin_alb_dns = "<new-ALB-dns>"
+```
 
-### 3. Configure Service Discovery (AWS Cloud Map)
-To resolve microservice names internally without exposing services to the public internet, enable **ECS Service Discovery** on each Service:
-*   Create a private DNS namespace: `fleetops.local`.
-*   When provisioning the ECS Services:
-    *   Auth service → registers as `auth.fleetops.local`.
-    *   Vehicle service → registers as `vehicle.fleetops.local`.
-    *   Maintenance service → registers as `maintenance.fleetops.local`.
-    *   Request service → registers as `request.fleetops.local`.
-*   Update `request-service` task definition configuration URLs:
-    *   `VEHICLE_SERVICE_URL` = `http://vehicle.fleetops.local:8080`
-    *   `MAINTENANCE_SERVICE_URL` = `http://maintenance.fleetops.local:8080`
+### 4. Apply again to create Route53 DNS records
+```bash
+terraform apply -auto-approve
+```
 
-### 4. Create ECS Services
-Launch the tasks inside the cluster:
-*   **Launch Type:** Fargate
-*   **Deployment Option:** Service (replica count: 2 for high availability)
-*   **Networking:**
-    *   VPC: `fleetops-vpc`
-    *   Subnets: `Private App Subnet A` and `Private App Subnet B`
-    *   Security Group: Allow inbound traffic on port `8080` from the ALB Security Group.
-    *   Public IP: Disabled (routes out via NAT Gateway).
+### 5. Update domain registrar NS records (if new hosted zone)
+Get new nameservers from Route53 and update at your registrar.
 
-### 5. Application Load Balancer Routing Setup
-Configure an AWS Application Load Balancer (ALB) to route external user requests to the appropriate Fargate service:
-
-1.  **Launch ALB:**
-    *   **Scheme:** Internet-facing
-    *   **Subnets:** `Public Subnet A` and `Public Subnet B`
-    *   **Security Group:** Allow HTTP (port 80) and HTTPS (port 443) from Anywhere (`0.0.0.0/0`).
-2.  **Define Target Groups:** Create 5 Target Groups in ECS, all targeting `IP` addresses on port `8080` (except frontend on port 80):
-    *   `tg-auth-service` (Health path: `/actuator/health`)
-    *   `tg-vehicle-service` (Health path: `/actuator/health`)
-    *   `tg-maintenance-service` (Health path: `/actuator/health`)
-    *   `tg-request-service` (Health path: `/actuator/health`)
-    *   `tg-frontend` (Health path: `/`)
-3.  **Configure Listener Routing Rules:** Setup Path-based Routing on your ALB listener:
-    *   Path Pattern `/api/auth/*` → Forward to `tg-auth-service` (strip `/api` or rewrite prefix if necessary, or let Spring controllers map `/api/auth` directly).
-    *   Path Pattern `/api/vehicles/*` → Forward to `tg-vehicle-service`.
-    *   Path Pattern `/api/requests/*` → Forward to `tg-request-service`.
-    *   Path Pattern `/api/tasks/*` → Forward to `tg-maintenance-service`.
-    *   Default Rule (matches all other requests `/*`) → Forward to `tg-frontend`.
-
-### 6. Frontend hosting on AWS S3 + CloudFront (Highly Recommended Option)
-Instead of serving static files via an Nginx container task inside ECS, deploy the built React assets serverlessly to AWS S3:
-
-1.  **Upload Assets:** Compile the assets using `npm run build` and upload the files to an **Amazon S3 Bucket** configured for static website hosting.
-2.  **Configure CloudFront CDN:** Connect an **Amazon CloudFront Distribution** pointing to the S3 bucket as its origin.
-3.  **Add Behavior Rules to CDN:**
-    *   Behavior matching path `/api/*` → Forward to the Application Load Balancer.
-    *   Default Behavior (`*`) → Route directly to S3.
-    *   *Custom Error Response:* Map HTTP 404 to `/index.html` with a 200 OK status to support React Router client-side routing.
+### 6. Verify everything is up
+```bash
+kubectl get applications -n argocd
+kubectl get pods -n fleetops-prod
+curl https://fleetops.website/actuator/health  # should return 200
+```
 
 ---
 
-## 📈 Step 8: Health Checks & Validation
+## CI/CD Pipeline Details
 
-Once deployed:
-1.  **Monitor Target Groups:** Check that all ECS targets display a `Healthy` status.
-2.  **Verify Endpoints:** Execute queries against the public ALB DNS or CloudFront domain:
-    *   `https://<your-domain>/health/auth`
-    *   `https://<your-domain>/api/vehicles` (should return 401/403 if unauthenticated, proving API connectivity).
-3.  **Execute Audit Run:** Deploy a temporary staging test script on an EC2 runner to trigger the 33 API test suite against the target production endpoints to guarantee complete operational compliance.
+### Service Pipeline (per microservice)
+
+Located in each service repo under `.github/workflows/`. Uses shared templates from `fleetops-github-workflows/`.
+
+```
+Trigger: push to main
+Steps:
+  1. Checkout
+  2. Set up Java 21 / Node 20
+  3. Run tests (Maven / npm test)
+  4. Configure AWS credentials via OIDC
+  5. Login to ECR
+  6. Build Docker image
+  7. Push image with tags: <git-sha>, latest
+  8. Update image.tag in fleetops-deployments/charts/<service>/values.yaml
+  9. Commit and push to fleetops-deployments
+  10. ArgoCD auto-syncs (automated sync policy with selfHeal)
+```
+
+### Terraform Pipeline
+
+Located in `fleetops-terraform/.github/workflows/terraform-apply.yml`.
+
+```
+Trigger: push to main (environments/prod/ path)
+Steps:
+  1. Checkout
+  2. Configure AWS credentials via OIDC
+  3. terraform init
+  4. terraform plan → save tfplan artifact
+  5. Manual approval (environment protection rule)
+  6. terraform apply tfplan
+  7. Extract outputs → write infra-values.yaml to fleetops-deployments
+```
 
 ---
-*Next Step: Proceed to [Amazon Bedrock AI Co-Pilot Blueprint](./AI_INTEGRATION.md).*
+
+## Useful Commands
+
+### Check cluster health
+```bash
+aws eks update-kubeconfig --name fleetops-prod-eks --region us-east-1
+kubectl get nodes
+kubectl get pods -n fleetops-prod
+kubectl get applications -n argocd
+```
+
+### Force ArgoCD sync
+```bash
+kubectl -n argocd patch application <app-name> \
+  --type merge -p '{"operation":{"sync":{"revision":"HEAD"}}}'
+```
+
+### Check service logs
+```bash
+kubectl logs -n fleetops-prod -l app=fleetops-vehicle-service --tail=100
+kubectl logs -n fleetops-prod -l app=fleetops-auth-service --tail=100
+```
+
+### Check secrets are synced
+```bash
+kubectl get externalsecrets -n fleetops-prod
+kubectl get secrets -n fleetops-prod
+```
+
+### Check Terraform state
+```bash
+cd fleetops-terraform/environments/prod/
+terraform state list
+terraform output
+```
+
+### Access ArgoCD CLI
+```bash
+argocd login argocd.fleetops.website
+argocd app list
+argocd app sync fleetops-vehicle-prod
+```
+
+---
+
+## Pre-Evaluation Checklist
+
+Before the evaluation session, complete these steps:
+
+- [ ] Rotate GitHub PAT — generate new token, update GitHub Secret + `terraform.tfvars`
+- [ ] Remove plaintext secrets from `terraform.tfvars` (move values to Secrets Manager or use env vars)
+- [ ] Remove static Bedrock credentials — switch to IRSA (already set up, just remove static keys)
+- [ ] Run `terraform apply` and verify all resources are up
+- [ ] Confirm `fleetops.website` returns 200
+- [ ] Confirm ArgoCD shows all 11 apps Synced + Healthy
+- [ ] Confirm all 10 pods are 1/1 Running in `fleetops-prod` namespace
+- [ ] Test AI Fleet Advisor via the UI
+- [ ] Test login, vehicle CRUD, maintenance tasks, service requests end-to-end
+
+---
+
+## Troubleshooting
+
+### 502 Bad Gateway on fleetops.website
+1. Check pods: `kubectl get pods -n fleetops-prod`
+2. Check Ingress: `kubectl describe ingress -n fleetops-prod`
+3. Check ArgoCD apps are all Synced
+4. Check ALB target group health in AWS console
+5. Verify `origin_alb_dns` in `prod.auto.tfvars` matches current ALB
+
+### ArgoCD app OutOfSync
+```bash
+kubectl describe application <app-name> -n argocd | grep -A5 "Conditions"
+# Read the sync error message, fix the manifest in fleetops-deployments, push
+```
+
+### Pod CrashLoopBackOff
+```bash
+kubectl logs -n fleetops-prod <pod-name> --previous
+kubectl describe pod -n fleetops-prod <pod-name>
+# Usually: secret not synced, wrong env var, DB connection issue
+```
+
+### Secrets not syncing (ESO)
+```bash
+kubectl get clustersecretstore
+kubectl describe externalsecret fleetops-postgres-secret -n fleetops-prod
+# Check IRSA role has correct Secrets Manager permissions
+```

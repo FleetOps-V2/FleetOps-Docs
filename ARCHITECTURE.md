@@ -1,245 +1,293 @@
-# 🏗️ FleetOps Core Architecture & System Audit
-
-This document provides a deep dive into the technical architecture of the FleetOps platform, detailing microservice communication, security enforcement, caching mechanisms, database schemas, and the final verification audit results.
+# FleetOps V2 — System Architecture
 
 ---
 
-## 🗺️ System Topology
+## High-Level Architecture
 
-All services are containerized and communicate within an isolated Docker bridge network (`fleetops-network`). Only the Nginx Gateway is exposed to the outer host network.
-
-```text
-                  ┌────────────────────────────────────────┐
-                  │            Client Browser              │
-                  └───────────────────┬────────────────────┘
-                                      │ HTTP :8080
-                                      ▼
-                  ┌────────────────────────────────────────┐
-                  │            Nginx API Gateway           │
-                  │        (Exposed Host Port 8080)        │
-                  └─────────┬──────┬──────┬──────┬─────────┘
-                            │      │      │      │
-            /api/auth/*     │      │      │      │ /api/tasks/*
-         ┌──────────────────┘      │      │      └───────────────────┐
-         │                         │      │                          │
-         ▼ (Port 8080)             │      │                          ▼ (Port 8080)
-┌──────────────────┐               │      │                 ┌──────────────────┐
-│   Auth Service   │               │      │                 │   Maintenance    │
-│  (User & JWT)    │               │      │                 │     Service      │
-└────────┬─────────┘               │      │                 └────────┬─────────┘
-         │                         │      │                          │
-         │          /api/vehicles/*│      │/api/requests/*           │
-         │         ┌───────────────┘      └──────────────┐           │
-         │         ▼ (Port 8080)                         ▼ (Port 8080)         │
-         │  ┌──────────────┐                       ┌──────────────┐  │
-         │  │   Vehicle    │◄──────────────────────┤   Request    │  │
-         │  │   Service    │   Sync Status REST    │   Service    │  │
-         │  └──────┬───────┘                       └──────┬───────┘  │
-         │         │                                      │          │
-         │         │ (Port 6379)                          │          │
-         │         ▼                                      │          │
-         │  ┌──────────────┐                              │          │
-         │  │ Redis Cache  │                              │          │
-         │  └──────────────┘                              │          │
-         └─────────┼──────────────┬──────────────┬────────┼──────────┘
-                   │              │              │        │
-                   ▼              ▼              ▼        ▼ (Port 5432)
-         ┌───────────────────────────────────────────────────────────┐
-         │                    PostgreSQL Cluster                     │
-         │    [auth_db]       [vehicle_db]   [request_db] [maint_db] │
-         └───────────────────────────────────────────────────────────┘
+```
+                        [ User Browser ]
+                               │ HTTPS
+                               ▼
+                    ┌─────────────────────┐
+                    │   Amazon CloudFront  │  WAF v2 (rate limit, geo block)
+                    │   fleetops.website   │  TLS via ACM wildcard cert
+                    └──────────┬──────────┘
+                               │ HTTPS → origin.fleetops.website
+                               ▼
+                    ┌─────────────────────┐
+                    │    AWS ALB (shared)  │  group.name: fleetops
+                    │  k8s-fleetops-*      │  host-based routing
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+              ▼                ▼                ▼
+     [fleetops.website]  [argocd.fleetops.website]  (future services)
+              │
+    ┌─────────▼──────────────────────────────────────┐
+    │              Amazon EKS Cluster                 │
+    │           Namespace: fleetops-prod              │
+    │                                                 │
+    │  ┌────────────┐  ┌────────────┐                │
+    │  │  frontend  │  │auth-service│                │
+    │  │  (Nginx)   │  │(Spring Boot│                │
+    │  └────────────┘  └─────┬──────┘               │
+    │                        │ JWT validation         │
+    │  ┌────────────┐  ┌─────▼──────┐               │
+    │  │  vehicle   │  │maintenance │                │
+    │  │  service   │  │  service   │                │
+    │  └──────┬─────┘  └─────┬──────┘               │
+    │         │               │                      │
+    │  ┌──────▼─────┐        │                      │
+    │  │  request   │◄───────┘                      │
+    │  │  service   │                                │
+    │  └────────────┘                                │
+    └──────────┬──────────────────────────────────────┘
+               │
+    ┌──────────┼──────────────────────┐
+    │          │                      │
+    ▼          ▼                      ▼
+[RDS Postgres] [ElastiCache Redis]  [AWS Services]
+                                    (Bedrock, SNS,
+                                     Step Functions,
+                                     Secrets Manager)
 ```
 
 ---
 
-## 🛠️ Microservice Directory
+## Infrastructure Layer (Terraform)
 
-### 1. API Gateway (`nginx:alpine`)
-*   **Host Port:** `8080` (Exposed)
-*   **Config File:** `fleetops-infra/nginx/gateway.conf`
-*   **Routing Table:**
-    *   `/api/auth/*` → `http://auth-service:8080/auth/*`
-    *   `/api/vehicles/*` → `http://vehicle-service:8080/api/vehicles/*`
-    *   `/api/requests/*` → `http://request-service:8080/api/requests/*`
-    *   `/api/tasks/*` → `http://maintenance-service:8080/api/tasks/*`
-    *   `/health/{service}` → proxies health actuator checks (`/actuator/health`) for each microservice
-    *   `/*` (Fallback) → Serves React SPA static assets (`dist/`) with a `try_files` rule redirecting to `index.html` to support client-side React Router routing.
+All AWS resources are defined in `fleetops-terraform/` with a modular structure. Remote state is stored in S3 with DynamoDB locking.
 
-### 2. Auth Service (`fleetops-auth-service`)
-*   **Internal Port:** `8080`
-*   **Database:** `auth_db`
-*   **Technology:** Spring Boot 3 + Spring Security 6 + JJWT
-*   **Function:** Generates HS512 JWT tokens upon login, manages user records, and hashes credentials using BCrypt. Contains an idempotent database initializer bean which registers default credentials (`admin1`, `manager1`, `driver1/2/3`) under the `dev` Spring profile.
+### Terraform Module Map
 
-### 3. Vehicle Service (`fleetops-vehicle-service`)
-*   **Internal Port:** `8080`
-*   **Database:** `vehicle_db`
-*   **Cache:** Redis 7 (`fleetops-redis:6379` with a 5-minute TTL)
-*   **Function:** Tracks catalog details, mileage, driver assignment, insurance dates, and computes dashboard metrics. Serves caching annotations (`@Cacheable`, `@CacheEvict`) with a fallback connection validator that falls back to direct database queries if Redis is offline.
+| Module | Resources Created |
+|---|---|
+| `modules/networking` | VPC, public/private subnets, NAT gateway, route tables, VPC flow logs |
+| `modules/eks/cluster` | EKS control plane, KMS encryption for secrets, CloudWatch log groups |
+| `modules/eks/nodegroup` | Managed node group (m7i-flex.large, 2–5 nodes) |
+| `modules/eks/addons` | ArgoCD, ALB Controller, External Secrets Operator, Cluster Autoscaler, Metrics Server |
+| `modules/rds` | RDS PostgreSQL 15, multi-AZ subnet group, KMS encryption |
+| `modules/redis` | ElastiCache Redis 7 cluster |
+| `modules/acm` | ACM wildcard certificate (*.fleetops.website) with DNS validation |
+| `modules/cloudfront` | CloudFront distribution pointing to origin.fleetops.website |
+| `modules/waf` | WAF v2 web ACL (rate limiting, managed rule groups) |
+| `modules/route53` | Hosted zone, A records (fleetops.website → CloudFront, origin → ALB, argocd → ALB) |
+| `modules/iam` | IRSA roles (app, ALB controller, external secrets, cluster autoscaler), GitHub Actions OIDC role |
+| `modules/secrets-manager` | fleetops/prod/db, fleetops/prod/jwt, fleetops/prod/github-pat, fleetops/prod/lambda-service-credentials |
+| `modules/ssm` | /fleetops/prod/redis/endpoint, /fleetops/prod/sns/*, /fleetops/prod/app/* |
+| `modules/kms` | KMS keys for RDS, Secrets Manager, S3 |
+| `modules/s3` | Vehicle documents bucket (KMS encrypted, versioning enabled) |
+| `modules/lambda` | Lambda function for internal service operations |
+| `modules/step-functions` | Service request state machine |
+| `modules/sns` | Insurance alert topic, service alert topic |
+| `modules/eventbridge` | Daily maintenance scan rule → Lambda/SNS target |
+| `modules/cloudtrail` | CloudTrail trail → S3 for API audit logging |
+| `modules/config` | AWS Config recorder for compliance checks |
 
-### 4. Maintenance Service (`fleetops-maintenance-service`)
-*   **Internal Port:** `8080`
-*   **Database:** `maintenance_db`
-*   **Function:** Stages a queue of pending tasks for individual users. It allows drivers to draft and hold issues before turning them into formal service requests.
+### Networking Design
 
-### 5. Request Service (`fleetops-request-service`)
-*   **Internal Port:** `8080`
-*   **Database:** `request_db`
-*   **Function:** Manages the core service request lifecycle state machine. It communicates directly with `vehicle-service` and `maintenance-service` to sync vehicle status changes and dispatch technician maintenance queues.
-
----
-
-## 🔒 Security & JWT Validation Model
-
-Instead of relying on a centralized API Gateway decrypting tokens (which creates an internal security vacuum), FleetOps implements **Stateless JWT Validation** inside *each* backend service.
-
-```text
-User Request ──► [API Gateway] ──► [Target Microservice]
-                                            │
-                                            ├─► 1. Extract Header "Authorization: Bearer <JWT>"
-                                            ├─► 2. Decrypt & Verify Signature using Shared Secret
-                                            ├─► 3. Extract Role Claims (ROLE_ADMIN, etc.)
-                                            └─► 4. Apply Method-Level Spring Security Check
+```
+VPC: 10.2.0.0/16
+├── Public Subnets (ALB, NAT)
+│   ├── 10.2.1.0/24  (us-east-1a)
+│   └── 10.2.2.0/24  (us-east-1b)
+└── Private Subnets (EKS nodes, RDS, Redis)
+    ├── 10.2.10.0/24 (us-east-1a)
+    └── 10.2.11.0/24 (us-east-1b)
 ```
 
-*   **Algorithm:** HMAC-SHA512 (`HS512`)
-*   **Shared Secret:** Injected via the `JWT_SECRET` environment variable into all microservice task definitions.
-*   **RBAC Enforcement:** Method-level security is declared on controller endpoints using Spring's `@PreAuthorize` annotation:
-    *   `@PreAuthorize("hasRole('ADMIN')")`
-    *   `@PreAuthorize("hasAnyRole('DRIVER', 'MANAGER', 'ADMIN')")`
+EKS nodes, RDS, and Redis run in private subnets. Only the ALB and NAT gateway are in public subnets. All outbound internet traffic from pods goes through the NAT gateway.
 
 ---
 
-## ⚡ Redis Caching Architecture
+## GitOps Layer (ArgoCD + fleetops-deployments)
 
-Caching is applied selectively to read-heavy, low-frequency mutation queries in the **Vehicle Service** to optimize response times and database load.
+ArgoCD runs inside the EKS cluster. It watches the `fleetops-deployments` GitHub repository and automatically applies any changes to the cluster.
 
-### Cache Regions & Key Structure
-*   `vehicles::all` — List of all vehicles in the catalog.
-*   `vehicles::type:<type>` — Filtered lists (e.g., `vehicles::type:SUV`).
-*   `vehicles::status:<status>` — Lifecycle state lists.
-*   `vehicles::driver:<driverId>` — Assigned driver listings.
-*   `vehicle::<id>` — Single vehicle detail cache.
+### App-of-Apps Pattern
 
-### Eviction Policy
-To prevent stale reads, mutations trigger eviction across affected cache regions using `@CacheEvict` or composite `@Caching` annotations:
-```java
-@Caching(evict = {
-    @CacheEvict(value = "vehicle", key = "#id"),
-    @CacheEvict(value = "vehicles", allEntries = true)
-})
-@Transactional
-public Optional<Vehicle> updateVehicle(Long id, Vehicle details) { ... }
+```
+fleetops-root-prod (ArgoCD Application)
+├── Points to: argocd/apps/prod/
+└── Manages these child apps:
+    ├── fleetops-platform-prod    → k8s/platform/     (ServiceAccount, RBAC, ESO stores)
+    ├── fleetops-secrets-prod     → k8s/platform/external-secrets.yaml
+    ├── fleetops-networkpolicy-prod → k8s/policies/
+    ├── fleetops-ingress-prod     → charts/ingress/   (ALB Ingress resource)
+    ├── fleetops-auth-prod        → charts/auth-service/
+    ├── fleetops-vehicle-prod     → charts/vehicle-service/
+    ├── fleetops-maintenance-prod → charts/maintenance-service/
+    ├── fleetops-request-prod     → charts/request-service/
+    ├── fleetops-frontend-prod    → charts/frontend/
+    └── fleetops-db-init-prod     → k8s/prod/db-init/ (one-time DB schema migration)
 ```
 
-### Redis Resilience (NoOp Fallback)
-If Redis is offline or crashes, a custom `CacheManager` bean catches the connection exception and falls back to a `NoOpCacheManager`, allowing database queries to execute directly without failing client requests.
+The root app is created by Terraform via `kubernetes_manifest` resource (in `modules/eks/addons/main.tf`). Once Terraform creates it, ArgoCD self-manages everything from that point forward.
 
----
+### Repository Layout
 
-## ⚙️ Service Request State Machine
-
-Service requests follow a strict state machine workflow. State transitions trigger cross-service database synchronization.
-
-```text
- [OPEN] ──────► [PENDING_APPROVAL] ──────► [APPROVED] ──────► [ASSIGNED] ──────► [IN_PROGRESS] ──────► [COMPLETED]
-   │                   │                     │                                        │
- (Draft)        (Awaiting Mgr)         (Technician                              (Vehicle status
-                                         Assigned)                               set to IN_SERVICE)
 ```
-
-1.  **Draft / Create:** A driver drafts task queue items in the Maintenance Service, then submits them to create an `OPEN` service request.
-2.  **Submission:** The state changes to `PENDING_APPROVAL` for manager review.
-3.  **Approval:** A manager approves the request (`APPROVED`).
-4.  **Technician Assignment:** A technician is assigned, moving the request to `ASSIGNED`. Under the hood, this **automatically dispatches** a new task to the assigned technician's maintenance queue.
-5.  **Execution:** The technician accepts the job, shifting it to `IN_PROGRESS`.
-    *   *Cross-Service Trigger:* Request Service calls Vehicle Service endpoint `/api/vehicles/{id}/status` to set the vehicle status to `IN_SERVICE`.
-6.  **Completion:** The technician finishes the repairs and inputs resolution notes and downtime.
-    *   *Cross-Service Trigger:* Request Service calls Vehicle Service to return the vehicle status to `ACTIVE`.
-
----
-
-## 🗄️ Database Schemas & Partitioning
-
-All microservices share a single PostgreSQL container but write to separate, isolated schemas. The database init container executes `init-multiple-dbs.sh` to build:
-*   `auth_db` — Table `users` (id, email, password_hash, role, username).
-*   `vehicle_db` — Table `vehicles` (id, brand, current_mileage, insurance_expiry, last_service_date, model, next_service_date, next_service_mileage, status, type, assigned_driver_id, vehicle_number).
-*   `maintenance_db` — Tables `maintenance_queues` and `pending_tasks`.
-*   `request_db` — Table `service_requests` (id, approved_by, assigned_technician, created_at, description, downtime_hours, priority, request_type, resolution_notes, requested_by, status, vehicle_id, vehicle_number).
-
----
-
-## 📊 Complete Verification Audit Report
-
-A complete verification audit was conducted on the final integration codebase. All tests executed successfully against the local Docker containers and Vite development server.
-
-*   **Result:** `33 / 33 PASSED`
-*   **System Health:** `100% GREEN`
-
-### Audit Log Details
-
-```text
-[SYSTEM AUDIT STATUS]
-========================================================================
-AUTH SERVICE:
-  - Admin login (admin1 / Admin@123) → Role: ADMIN .................. [✅ PASS]
-  - Manager login (manager1 / Manager@123) → Role: MANAGER .......... [✅ PASS]
-  - Driver login (driver1 / Driver@123) → Role: DRIVER .............. [✅ PASS]
-  - Invalid credentials return HTTP 401 Unauthorized ................ [✅ PASS]
-  - Requests without JWT tokens return HTTP 403 Forbidden ........... [✅ PASS]
-
-VEHICLE SERVICE:
-  - GET /api/vehicles (Admin reads full fleet of 15) ................ [✅ PASS]
-  - GET /api/vehicles (Driver reads only assigned vehicle) .......... [✅ PASS]
-  - GET /api/vehicles/1 (Verify specific data fields) ............... [✅ PASS]
-  - GET /api/vehicles/dashboard (KPI aggregate validation) .......... [✅ PASS]
-  - GET /api/vehicles/alerts/insurance (Cutoff calculation) ......... [✅ PASS]
-  - GET /api/vehicles/alerts/service (Due criteria calculation) ..... [✅ PASS]
-  - POST /api/vehicles (Admin registers new truck) .................. [✅ PASS]
-  - PATCH /api/vehicles/{id}/status (Status transition) ............. [✅ PASS]
-  - PATCH /api/vehicles/{id}/mileage (Mileage updates) .............. [✅ PASS]
-  - POST /api/vehicles (Driver unauthorized access check) ............ [✅ PASS]
-  - DELETE /api/vehicles/{id} (Admin deletes retired model) ......... [✅ PASS]
-
-REQUEST SERVICE & STATE MACHINE:
-  - GET /api/requests (Admin retrieves historical list) .............. [✅ PASS]
-  - GET /api/requests (Driver fetches only self-submitted) .......... [✅ PASS]
-  - POST /api/requests (Driver submits service request) ............. [✅ PASS]
-  - State Transition: OPEN → PENDING_APPROVAL ........................ [✅ PASS]
-  - State Transition: PENDING_APPROVAL → APPROVED ................... [✅ PASS]
-  - State Transition: APPROVED → ASSIGNED (Technician assigned) ...... [✅ PASS]
-  - State Transition: ASSIGNED → IN_PROGRESS (Vehicle in service) .... [✅ PASS]
-  - Synchronous Sync: Vehicle state set to IN_SERVICE ............... [✅ PASS]
-  - State Transition: IN_PROGRESS → COMPLETED (Job resolution) ....... [✅ PASS]
-  - Synchronous Sync: Vehicle state set back to ACTIVE .............. [✅ PASS]
-
-MAINTENANCE QUEUE SERVICE:
-  - GET /api/tasks (Fetch staged tasks) ............................ [✅ PASS]
-  - POST /api/tasks/add (Queue drafting task) ....................... [✅ PASS]
-  - DELETE /api/tasks/clear (Clear staging queue) ................... [✅ PASS]
-
-INTEGRATION GATEWAY & ROUTING:
-  - Actuator: /health/auth status UP ............................... [✅ PASS]
-  - Actuator: /health/vehicles status UP ........................... [✅ PASS]
-  - Actuator: /health/requests status UP ........................... [✅ PASS]
-  - Actuator: /health/maintenance status UP ........................ [✅ PASS]
-  - Vite Proxy: Front-to-Back requests map without CORS issues ...... [✅ PASS]
-========================================================================
+fleetops-deployments/
+├── argocd/apps/prod/          ArgoCD Application manifests (child apps)
+├── charts/                    Helm charts for each service
+│   ├── auth-service/
+│   ├── vehicle-service/
+│   ├── maintenance-service/
+│   ├── request-service/
+│   ├── frontend/
+│   ├── ingress/               ALB Ingress with ACM cert + WAF SG
+│   └── common/                Shared chart helpers
+├── k8s/
+│   ├── platform/              ServiceAccount (IRSA annotated), ClusterSecretStore, ESO ExternalSecrets
+│   ├── policies/              NetworkPolicy (deny-all default, explicit allow)
+│   ├── prod/                  Production-specific overrides (RBAC, db-init job)
+│   └── base/                  Base manifests shared across environments
+└── environments/
+    └── prod/infra-values.yaml  certArn, albSgId, hostedZoneId (written by Terraform pipeline)
 ```
 
 ---
 
-## 🐛 Resolved Development Bugs
+## Secret Management (ESO + AWS)
 
-During integration testing, two critical bugs were diagnosed and patched:
+No secrets are stored in Kubernetes manifests or Git. All secrets come from AWS.
 
-### 1. Vite Development Server CORS Block
-*   **Issue:** Running the React app on `localhost:5173` while backend services were exposed on `localhost:8080` resulted in CORS errors when trying to make POST requests (e.g. login).
-*   **Resolution:** Configured `vite.config.ts` to implement a dev server proxy. Any route matching `/api/*` or `/health/*` is proxied to `localhost:8080` transparently, removing the cross-origin boundary. The frontend client base URL was shifted to relative `/` paths.
-
-### 2. Authentication Route Mismatches
-*   **Issue:** The frontend API service called endpoints like `/auth/login` directly, bypassing the Gateway's routing structure which expected `/api/auth/login`.
-*   **Resolution:** Modified `fleetops-frontend/src/services/api.js` to target the unified `/api/auth/...` prefix, matching Nginx's location routing block.
+```
+AWS Secrets Manager                    AWS SSM Parameter Store
+├── fleetops/prod/db          ─────►  /fleetops/prod/redis/endpoint
+│   username, password, host          /fleetops/prod/sns/insurance-alerts-arn
+├── fleetops/prod/jwt                 /fleetops/prod/sns/service-alerts-arn
+│   jwt_secret                        /fleetops/prod/app/base-url
+├── fleetops/prod/github-pat          /fleetops/prod/app/spring-profile
+│   token
+└── fleetops/prod/lambda-service-credentials
+    password
+         │
+         │  External Secrets Operator (ClusterSecretStore)
+         │  IRSA → fleetops-prod-external-secrets-role
+         ▼
+Kubernetes Secrets (in fleetops-prod namespace)
+├── fleetops-postgres-secret     POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_HOST
+├── fleetops-app-secret          JWT_SECRET
+├── fleetops-redis-secret        REDIS_HOST
+├── fleetops-sns-secret          INSURANCE_SNS_TOPIC_ARN, SERVICE_SNS_TOPIC_ARN
+└── fleetops-lambda-service-secret  LAMBDA_SERVICE_PASSWORD
+```
 
 ---
-*Next Step: Proceed to [AWS Production Provisioning Guide](./DEPLOYMENT_AWS.md).*
+
+## IRSA (IAM Roles for Service Accounts)
+
+Pods never use static AWS credentials. Each component has its own IAM role assigned via Kubernetes Service Account annotation.
+
+| Service Account | IAM Role | Permissions |
+|---|---|---|
+| `fleetops-app` (all app pods) | `fleetops-prod-app-irsa-role` | Secrets Manager read, SSM read, S3 (vehicle docs), Bedrock InvokeModel |
+| `external-secrets` | `fleetops-prod-external-secrets-role` | Secrets Manager read, SSM read |
+| `aws-load-balancer-controller` | `fleetops-prod-alb-controller-role` | EC2/ELB management |
+| `cluster-autoscaler` | `fleetops-prod-cluster-autoscaler-role` | EC2 Auto Scaling |
+
+---
+
+## CI/CD Pipeline (GitHub Actions)
+
+Every service has its own pipeline. Shared workflow templates live in `fleetops-github-workflows/`.
+
+### Pipeline Flow (per microservice)
+
+```
+Code Push to main
+       │
+       ▼
+1. Build & Test (Maven / npm)
+       │
+       ▼
+2. Docker Build + Push to ECR
+   (tag: SHA + latest)
+       │
+       ▼
+3. Update image tag in fleetops-deployments
+   (charts/<service>/values.yaml → image.tag)
+       │
+       ▼
+4. ArgoCD detects change in deployments repo
+       │
+       ▼
+5. ArgoCD applies new Deployment to EKS
+   (rolling update, zero downtime)
+```
+
+Authentication to AWS uses **OIDC** — GitHub Actions assumes `fleetops-prod-github-actions-role` without any stored AWS keys.
+
+### Terraform Pipeline (fleetops-terraform)
+
+```
+Push to main (environments/prod/ changes)
+       │
+       ▼
+1. terraform init (S3 backend)
+       │
+       ▼
+2. terraform plan → saved as tfplan artifact
+       │
+       ▼
+3. Manual approval gate
+       │
+       ▼
+4. terraform apply tfplan
+       │
+       ▼
+5. Extract outputs (ALB DNS, cert ARN, etc.)
+   Write to fleetops-deployments/environments/prod/infra-values.yaml
+```
+
+---
+
+## Traffic Flow (Request Path)
+
+```
+User → fleetops.website
+  → CloudFront (WAF check, cache check)
+  → origin.fleetops.website (Route53 alias → ALB)
+  → ALB (host-based routing → EKS NodePort)
+  → Nginx Ingress → Kubernetes Service → Pod
+
+Within the cluster (service-to-service):
+  → Pod calls http://fleetops-<service>:8080
+  → Kubernetes DNS resolves to ClusterIP Service
+  → Routes to healthy pod (liveness/readiness probes)
+
+Auth enforcement:
+  → Each backend service validates JWT via Spring Security filter
+  → Token issued by auth-service, validated independently (shared JWT_SECRET from ESO)
+```
+
+---
+
+## Database Schema
+
+One RDS PostgreSQL instance hosts four schemas — one per service:
+
+| Schema | Owner Service | Key Tables |
+|---|---|---|
+| `auth_db` | auth-service | users, roles |
+| `vehicle_db` | vehicle-service | vehicles, ai_analysis_audit |
+| `request_db` | request-service | service_requests |
+| `maintenance_db` | maintenance-service | maintenance_tasks |
+
+Each service connects only to its own schema using credentials from Secrets Manager. Cross-service data access goes through REST APIs, never direct DB calls.
+
+---
+
+## Observability
+
+| Tool | What It Monitors |
+|---|---|
+| EKS Control Plane Logs | API server, audit, scheduler — sent to CloudWatch |
+| VPC Flow Logs | All network traffic in/out of VPC |
+| AWS CloudTrail | All API calls in the account |
+| AWS Config | Resource compliance rules |
+| WAF Logs | Blocked/allowed requests → CloudWatch |
+| Pod logs | `kubectl logs` / CloudWatch Container Insights |
+| ArgoCD UI | Sync status, health status for all apps |
