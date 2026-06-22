@@ -1,0 +1,382 @@
+<mxfile host="Electron" version="21.0.0">
+  <diagram id="app-arch" name="Application Architecture">
+    <mxGraphModel dx="1422" dy="762" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2000" pageHeight="1550" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- TITLE -->
+        <mxCell id="title" value="FleetOps V2 — Application Architecture &amp; Service Interactions" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#232F3E;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1000" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- ===== REQUEST PATH HEADER ===== -->
+        <mxCell id="req_label" value="Request Path (HTTPS)" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=12;fontStyle=3;fontColor=#555555;" vertex="1" parent="1">
+          <mxGeometry x="40" y="65" width="200" height="25" as="geometry" />
+        </mxCell>
+
+        <!-- User Browser -->
+        <mxCell id="user" value="User Browser" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- CloudFront -->
+        <mxCell id="cf" value="CloudFront + WAF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8C4FFF;fontColor=#ffffff;strokeColor=#8C4FFF;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="240" y="100" width="160" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ALB -->
+        <mxCell id="alb" value="ALB&#xa;(group: fleetops)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8C4FFF;fontColor=#ffffff;strokeColor=#8C4FFF;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="460" y="100" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ===== EKS CLUSTER BOX ===== -->
+        <mxCell id="eks_box" value="Amazon EKS — Namespace: fleetops-prod" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=3;verticalAlign=top;fontSize=14;fontStyle=1;fontColor=#7a5c00;" vertex="1" parent="1">
+          <mxGeometry x="40" y="220" width="1120" height="830" as="geometry" />
+        </mxCell>
+
+        <!-- ===== FRONTEND ===== -->
+        <mxCell id="frontend_box" value="Frontend Service" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;verticalAlign=top;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="265" width="300" height="145" as="geometry" />
+        </mxCell>
+        <mxCell id="nginx" value="Nginx (Port 80)&#xa;Serves React SPA&#xa;Routes /api/* to backend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#326CE5;fontColor=#ffffff;strokeColor=#326CE5;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="80" y="300" width="260" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ===== AUTH SERVICE ===== -->
+        <mxCell id="auth_box" value="Auth Service" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;verticalAlign=top;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="400" y="265" width="300" height="145" as="geometry" />
+        </mxCell>
+        <mxCell id="auth_svc" value="Spring Boot (Port 8080)&#xa;POST /api/auth/login → JWT&#xa;POST /api/auth/register&#xa;Roles: ADMIN / MANAGER / DRIVER" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="415" y="300" width="265" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ===== VEHICLE SERVICE ===== -->
+        <mxCell id="vehicle_box" value="Vehicle Service" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;verticalAlign=top;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="450" width="380" height="195" as="geometry" />
+        </mxCell>
+        <mxCell id="vehicle_svc" value="Spring Boot (Port 8080)&#xa;GET /api/vehicles — fleet list (Redis cached)&#xa;GET /api/vehicles/ai/analyse → Bedrock&#xa;POST /api/documents/presigned-url — S3 upload&#xa;POST /api/vehicles — create vehicle&#xa;PUT /api/vehicles/{id}/status — update" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="75" y="485" width="350" height="140" as="geometry" />
+        </mxCell>
+
+        <!-- ===== MAINTENANCE SERVICE ===== -->
+        <mxCell id="maint_box" value="Maintenance Service" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;verticalAlign=top;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="480" y="450" width="380" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="maint_svc" value="Spring Boot (Port 8080)&#xa;GET/POST /api/maintenance — task management&#xa;POST /api/tasks/alarms/broadcast → SNS&#xa;POST /api/media/* — file upload → EFS mount" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="495" y="485" width="350" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- ===== REQUEST SERVICE ===== -->
+        <mxCell id="req_box" value="Request Service" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;verticalAlign=top;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="670" width="380" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="req_svc" value="Spring Boot (Port 8080)&#xa;POST /api/requests — create (→ Step Functions)&#xa;GET /api/requests — list requests&#xa;PUT /api/requests/{id}/status — update&#xa;Calls vehicle-service to sync status" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="75" y="705" width="350" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- ===== SHARED PLATFORM ===== -->
+        <mxCell id="platform_box" value="Shared Platform Components" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;strokeWidth=2;verticalAlign=top;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="480" y="670" width="660" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="jwt_filter" value="JWT Auth Filter (all services)&#xa;Validates Bearer token on every request&#xa;Shared JWT_SECRET from ESO → K8s Secret" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD344C;fontColor=#ffffff;strokeColor=#DD344C;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="495" y="700" width="290" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="irsa_note" value="IRSA (all pods)&#xa;fleetops-app ServiceAccount&#xa;IAM role: fleetops-prod-app-irsa-role&#xa;No static AWS creds in pods" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD344C;fontColor=#ffffff;strokeColor=#DD344C;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="815" y="700" width="290" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="eso_note" value="External Secrets Operator&#xa;Syncs every 1h: Secrets Manager + SSM → K8s Secrets&#xa;Pods mount secrets as ENV variables" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD344C;fontColor=#ffffff;strokeColor=#DD344C;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="495" y="800" width="610" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ArgoCD row -->
+        <mxCell id="argocd_row" value="ArgoCD (App-of-Apps) — syncs all K8s manifests from fleetops-deployments repo on every push" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="880" width="1080" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- NetworkPolicy -->
+        <mxCell id="netpol" value="NetworkPolicy (VPC: 10.2.0.0/16) — deny-all default: explicit allow between services (8080), RDS (5432), Redis (6379), EFS NFS (2049), AWS APIs (443)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#555555;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="950" width="1080" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Cluster Autoscaler -->
+        <mxCell id="autoscaler" value="Cluster Autoscaler: 2–5 × m7i-flex.large nodes   |   Metrics Server: HPA resource metrics" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#555555;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1005" width="1080" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ===== DATABASES ===== -->
+        <mxCell id="db_zone" value="Data Stores (database subnets — isolated RT, no NAT)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;dashed=1;verticalAlign=top;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1080" width="1120" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="auth_db" value="auth_db&#xa;(users, roles)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2E73B8;fontColor=#ffffff;strokeColor=#2E73B8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1120" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vehicle_db" value="vehicle_db&#xa;(vehicles,&#xa;ai_analysis_audit)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2E73B8;fontColor=#ffffff;strokeColor=#2E73B8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="255" y="1120" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="request_db" value="request_db&#xa;(service_requests)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2E73B8;fontColor=#ffffff;strokeColor=#2E73B8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="450" y="1120" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="maint_db" value="maintenance_db&#xa;(maintenance_tasks)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2E73B8;fontColor=#ffffff;strokeColor=#2E73B8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="645" y="1120" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="redis_cache" value="ElastiCache Redis&#xa;vehicle-service only&#xa;vehicles cache (5 min)&#xa;fleetAnalysis cache (5 min)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2E73B8;fontColor=#ffffff;strokeColor=#2E73B8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="840" y="1120" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="db_rds_label" value="RDS PostgreSQL 15 — one instance, four schemas, KMS encrypted" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontSize=10;fontStyle=2;fontColor=#555555;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1100" width="600" height="20" as="geometry" />
+        </mxCell>
+
+        <!-- ===== AWS MANAGED SERVICES (right panel) ===== -->
+        <mxCell id="aws_panel" value="AWS Managed Services" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff8f0;strokeColor=#FF9900;strokeWidth=2;dashed=1;verticalAlign=top;fontSize=13;fontStyle=1;fontColor=#FF9900;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="220" width="760" height="1160" as="geometry" />
+        </mxCell>
+
+        <!-- Bedrock -->
+        <mxCell id="bedrock_aws" value="Amazon Bedrock&#xa;Amazon Nova Lite&#xa;Converse API&#xa;maxTokens: 1200" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#01A88D;fontColor=#ffffff;strokeColor=#01A88D;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="265" width="200" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="bedrock_detail" value="Model: amazon.nova-lite-v1:0 (configurable via BEDROCK_MODEL_ID env var)&#xa;Input: vehicle list with exact numbers&#xa;(km overdue, days overdue, insurance status)&#xa;Output: fleetHealthScore + recommendations[]&#xa;{ priority, action, reasoning, confidence }&#xa;Cached 5 min in Redis per fleet state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f8f5;strokeColor=#01A88D;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="265" width="490" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- Step Functions -->
+        <mxCell id="stepfn_aws" value="Step Functions&#xa;Service Request&#xa;State Machine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E7157B;fontColor=#ffffff;strokeColor=#E7157B;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="400" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="stepfn_detail" value="Triggered on every new service request (POST /api/requests)&#xa;States: OPEN → PENDING_APPROVAL → APPROVED → ASSIGNED → IN_PROGRESS → COMPLETED&#xa;Execution ARN stored on ServiceRequest entity&#xa;ARN wired via infra-values.yaml from Terraform apply" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce4ec;strokeColor=#E7157B;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="400" width="490" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- SNS -->
+        <mxCell id="sns_aws" value="Amazon SNS&#xa;Insurance Alerts&#xa;Service Overdue Alerts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E7157B;fontColor=#ffffff;strokeColor=#E7157B;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="525" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="sns_detail" value="Topic 1: insurance-alerts — triggered when insurance&#xa;expires within 30 days (from maintenance-service scan)&#xa;Topic 2: service-alerts — triggered when service&#xa;is overdue by mileage or date" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce4ec;strokeColor=#E7157B;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="525" width="490" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- EventBridge -->
+        <mxCell id="eb_aws" value="EventBridge&#xa;Daily Alert Scan&#xa;rate(1 day)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E7157B;fontColor=#ffffff;strokeColor=#E7157B;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="650" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="eb_detail" value="Daily trigger → Lambda (alert-processor, Node.js)&#xa;Lambda: logs into auth-service, calls vehicle-service&#xa;GET /api/vehicles/alerts/insurance&#xa;GET /api/vehicles/alerts/service → publishes to SNS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce4ec;strokeColor=#E7157B;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="650" width="490" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- EFS (NEW) -->
+        <mxCell id="efs_aws" value="Amazon EFS&#xa;Shared Media Storage&#xa;(maintenance-service)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3F8624;fontColor=#ffffff;strokeColor=#3F8624;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="775" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="efs_detail" value="Mount: /var/www/fleetops/shared-media (EFS CSI Driver addon)&#xa;Access point scoped to /fleetops (uid:1000, gid:1000, 755)&#xa;KMS encrypted, ReadWriteMany — survives pod restarts&#xa;EFS mount targets in private subnets (port 2049 NFS)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f5e9;strokeColor=#3F8624;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="775" width="490" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- S3 — vehicle document storage (implemented) -->
+        <mxCell id="s3_aws" value="Amazon S3&#xa;Vehicle Documents&#xa;(KMS + presigned URLs)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3F8624;fontColor=#ffffff;strokeColor=#3F8624;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="895" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="s3_detail" value="Bucket: fleetops-prod-vehicle-docs — KMS encrypted, versioned, lifecycle archival&#xa;vehicle-service: POST /api/documents/presigned-url → S3 presigned PUT URL (15 min)&#xa;Browser PUTs file directly to S3; GET /api/documents/vehicle/{id} lists objects&#xa;IRSA: DefaultCredentialsProvider — no static AWS keys in pods" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f5e9;strokeColor=#3F8624;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="895" width="490" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Secrets Flow (shifted down +120px) -->
+        <mxCell id="secrets_flow" value="Secret Injection Flow" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff3e0;strokeColor=#DD344C;strokeWidth=2;verticalAlign=top;fontSize=12;fontStyle=1;fontColor=#DD344C;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="1015" width="710" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="sf1" value="AWS Secrets Manager&#xa;fleetops/prod/db&#xa;fleetops/prod/jwt&#xa;fleetops/prod/github-pat&#xa;fleetops/prod/lambda-svc-creds" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD344C;fontColor=#ffffff;strokeColor=#DD344C;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1235" y="1055" width="185" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="sf_arrow1" value="ESO reads&#xa;every 1h" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#DD344C;strokeWidth=2;dashed=1;" edge="1" source="sf1" target="sf3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sf2" value="SSM Parameter Store&#xa;/fleetops/prod/redis/endpoint&#xa;/fleetops/prod/sns/*&#xa;/fleetops/prod/app/*" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD344C;fontColor=#ffffff;strokeColor=#DD344C;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1055" width="185" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="sf_arrow2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#DD344C;strokeWidth=2;dashed=1;" edge="1" source="sf2" target="sf3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sf3" value="K8s Secrets&#xa;(fleetops-prod namespace)&#xa;Mounted as ENV vars in pods" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD344C;fontColor=#ffffff;strokeColor=#DD344C;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1645" y="1075" width="265" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- CI/CD Flow (shifted down +120px) -->
+        <mxCell id="cicd_flow" value="CI / CD Flow" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff8e1;strokeColor=#ED7100;strokeWidth=2;verticalAlign=top;fontSize=12;fontStyle=1;fontColor=#ED7100;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="1250" width="710" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="cicd1" value="1. Push to main" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#555555;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1235" y="1285" width="130" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="cicd2" value="2. GH Actions&#xa;Build + Test" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1385" y="1285" width="130" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="cicd3" value="3. Push image&#xa;to ECR" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3F8624;fontColor=#ffffff;strokeColor=#3F8624;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1535" y="1285" width="130" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="cicd4" value="4. Update tag&#xa;→ ArgoCD syncs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1685" y="1285" width="130" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ce1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#555555;strokeWidth=2;" edge="1" source="cicd1" target="cicd2" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ce2" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#555555;strokeWidth=2;" edge="1" source="cicd2" target="cicd3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ce3" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#555555;strokeWidth=2;" edge="1" source="cicd3" target="cicd4" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ===== CONNECTIONS ===== -->
+
+        <!-- User → CloudFront -->
+        <mxCell id="e1" value="HTTPS" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#232F3E;strokeWidth=2;" edge="1" source="user" target="cf" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- CloudFront → ALB -->
+        <mxCell id="e2" value="HTTPS" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#8C4FFF;strokeWidth=2;" edge="1" source="cf" target="alb" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ALB → Frontend -->
+        <mxCell id="e3" value="HTTP" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#326CE5;strokeWidth=2;" edge="1" source="alb" target="nginx" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ALB → Auth Service -->
+        <mxCell id="e4" value="/api/auth/*" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#ED7100;strokeWidth=2;" edge="1" source="alb" target="auth_svc" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ALB → Vehicle Service -->
+        <mxCell id="e5" value="/api/vehicles/*" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#ED7100;strokeWidth=2;" edge="1" source="alb" target="vehicle_svc" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ALB → Maintenance Service -->
+        <mxCell id="e6" value="/api/maintenance/*" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#ED7100;strokeWidth=2;" edge="1" source="alb" target="maint_svc" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ALB → Request Service -->
+        <mxCell id="e7" value="/api/requests/*" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#ED7100;strokeWidth=2;" edge="1" source="alb" target="req_svc" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Auth → auth_db -->
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#2E73B8;strokeWidth=2;" edge="1" source="auth_svc" target="auth_db" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Vehicle → vehicle_db (exit bottom → down to db zone) -->
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#2E73B8;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" source="vehicle_svc" target="vehicle_db" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="1080" />
+              <mxPoint x="337" y="1080" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Vehicle → Redis -->
+        <mxCell id="e10" value="cache" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#2E73B8;strokeWidth=2;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" source="vehicle_svc" target="redis_cache" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="1080" />
+              <mxPoint x="940" y="1080" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Vehicle → Bedrock: exit bottom → gap below maint_box → right corridor → up to Bedrock -->
+        <mxCell id="e11" value="AI Advisor" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#01A88D;strokeWidth=2;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="vehicle_svc" target="bedrock_aws" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="635" />
+              <mxPoint x="1175" y="635" />
+              <mxPoint x="1175" y="315" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Maintenance → maint_db (exit bottom → down to db zone) -->
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#2E73B8;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" source="maint_svc" target="maint_db" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="670" y="1080" />
+              <mxPoint x="727" y="1080" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Maintenance → SNS -->
+        <mxCell id="e13" value="alerts" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#E7157B;strokeWidth=2;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="maint_svc" target="sns_aws" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1180" y="545" />
+              <mxPoint x="1180" y="570" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- EventBridge → vehicle-service (via Lambda) -->
+        <mxCell id="e14" value="daily trigger (via Lambda)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#E7157B;strokeWidth=2;dashed=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="eb_aws" target="vehicle_svc" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1180" y="695" />
+              <mxPoint x="1180" y="545" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Request → request_db -->
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#2E73B8;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" source="req_svc" target="request_db" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="1080" />
+              <mxPoint x="532" y="1080" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Request → Step Functions -->
+        <mxCell id="e16" value="state machine" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#E7157B;strokeWidth=2;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="req_svc" target="stepfn_aws" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="860" />
+              <mxPoint x="1180" y="860" />
+              <mxPoint x="1180" y="445" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Request → Vehicle (REST sync) -->
+        <mxCell id="e17" value="PUT /status" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#555555;strokeWidth=2;dashed=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" source="req_svc" target="vehicle_svc" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Maintenance → EFS (media file upload) -->
+        <mxCell id="e18" value="media files" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#3F8624;strokeWidth=2;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="maint_svc" target="efs_aws" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1185" y="545" />
+              <mxPoint x="1185" y="820" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Vehicle → S3 (presigned URL flow — implemented) -->
+        <mxCell id="e18b" value="presigned PUT" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#3F8624;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="vehicle_svc" target="s3_aws" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="645" />
+              <mxPoint x="1190" y="645" />
+              <mxPoint x="1190" y="940" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
