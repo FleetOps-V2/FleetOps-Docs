@@ -78,10 +78,10 @@ All AWS resources are defined in `fleetops-terraform/` with a modular structure.
 | `modules/ssm` | /fleetops/prod/redis/endpoint, /fleetops/prod/sns/*, /fleetops/prod/app/* |
 | `modules/kms` | KMS keys for RDS, Secrets Manager, S3 |
 | `modules/s3` | Vehicle documents bucket (KMS encrypted, versioning enabled) |
-| `modules/lambda` | Lambda function for internal service operations |
+| `modules/lambda` | `alert-processor` (Node.js) — daily alert scan: fetches vehicle alerts, publishes to SNS |
 | `modules/step-functions` | Service request state machine |
 | `modules/sns` | Insurance alert topic, service alert topic |
-| `modules/eventbridge` | Daily maintenance scan rule → Lambda/SNS target |
+| `modules/eventbridge` | Daily rule `rate(1 day)` → triggers `alert-processor` Lambda |
 | `modules/cloudtrail` | CloudTrail trail → S3 for API audit logging |
 | `modules/config` | AWS Config recorder for compliance checks |
 

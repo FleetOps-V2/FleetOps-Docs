@@ -53,7 +53,7 @@ FleetOps-V2/
 | DNS & TLS | Route 53 + ACM wildcard certificate (*.fleetops.website) |
 | Workflow Automation | AWS Step Functions (service request state machine) |
 | Alerting | Amazon SNS (insurance expiry + service overdue notifications) |
-| Scheduled Jobs | Amazon EventBridge (daily fleet maintenance scan) |
+| Scheduled Jobs | Amazon EventBridge → Lambda (daily alert scan → SNS) |
 | Audit & Compliance | AWS CloudTrail, AWS Config, VPC Flow Logs, KMS encryption |
 
 ---
@@ -64,7 +64,7 @@ FleetOps-V2/
 |---|---|
 | `fleetops-auth-service` | JWT issuance, user registration/login, ROLE_ADMIN / ROLE_MANAGER / ROLE_DRIVER |
 | `fleetops-vehicle-service` | Vehicle CRUD, fleet health scoring, Redis cache, Bedrock AI advisor |
-| `fleetops-maintenance-service` | Maintenance task lifecycle, EventBridge-triggered scans, SNS alerts |
+| `fleetops-maintenance-service` | Maintenance task lifecycle, SNS alert broadcasts |
 | `fleetops-request-service` | Service request creation and tracking, Step Functions state machine |
 | `fleetops-frontend` | React SPA — dashboard, fleet view, AI advisor panel, request management |
 
