@@ -6375,3 +6375,225 @@ Terraform changes follow the GitOps pattern: (1) Feature branch with Terraform c
 
 *End of Q166â€“Q350 supplement. Total Q&A count: approximately 350 questions.*
 
+
+
+---
+
+## BEDROCK â€” CORRECTIONS & UPDATED REFERENCE
+
+> These entries supersede earlier Bedrock descriptions in this guide wherever they conflict.
+
+---
+
+### How vehicle-service calls Bedrock â€” CORRECTED
+
+**API used:** Bedrock **Converse API** â€” NOT `InvokeModel`.
+
+```
+POST https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.nova-lite-v1:0/converse
+```
+
+Java SDK call (`FleetAiService.java`):
+
+```java
+ConverseResponse response = bedrockClient.converse(
+    ConverseRequest.builder()
+        .modelId(modelId)                                      // amazon.nova-lite-v1:0
+        .messages(Message.builder()
+            .role(ConversationRole.USER)
+            .content(ContentBlock.fromText(prompt))
+            .build())
+        .inferenceConfig(InferenceConfiguration.builder()
+            .maxTokens(2500)
+            .build())
+        .build()
+);
+String text = response.output().message().content().get(0).text();
+```
+
+The Converse API is the preferred modern Bedrock API â€” model-agnostic, supports multi-turn conversation, no model-specific request body marshalling.
+
+---
+
+### Authentication â€” CORRECTED (static credentials are gone)
+
+**`BedrockConfig.java`** creates the `BedrockRuntimeClient` using one of two paths:
+
+```
+if bedrock.role-arn is set:
+    StsClient (DefaultCredentialsProvider) â†’ StsAssumeRoleCredentialsProvider
+        â†’ AssumeRole(bedrockRoleArn, sessionName="fleetops-bedrock-session")
+        â†’ temporary credentials for Bedrock calls
+else:
+    DefaultCredentialsProvider (uses IRSA projected token directly)
+```
+
+`DefaultCredentialsProvider` resolves credentials in order: env vars â†’ system properties â†’ `~/.aws/credentials` â†’ **ECS/EKS instance metadata (IRSA)**. Inside the pod, IRSA projected token is picked up automatically.
+
+**There are no static `bedrock_access_key` / `bedrock_secret_key` in the runtime path.** The `bedrock_access_key`/`bedrock_secret_key` variables in `prod.auto.tfvars` are a legacy config carried from an earlier version â€” they are not used by the current `BedrockConfig.java` implementation.
+
+STS connection is configured with 5-second connection timeout and 30-second socket timeout.
+
+---
+
+### Caching â€” CORRECTED
+
+**NOT** Redis key `ai-analysis:{vehicleId}` with 5-minute TTL.
+
+**ACTUAL implementation â€” two-layer design:**
+
+**Layer 1 â€” Spring AOP `@Cacheable`:**
+```java
+@Cacheable(value = "fleetAnalysis", key = "'current'")
+public FleetAnalysisResponse invokeBedrockCached() { ... }
+```
+Cache name: `fleetAnalysis`, cache key: literal string `"current"` (fleet-wide, not per vehicle).
+
+**Layer 2 â€” Redis backend (`CacheConfig.java`):**
+```java
+perCacheConfig.put("fleetAnalysis",
+    RedisCacheConfiguration.defaultCacheConfig()
+        .entryTtl(Duration.ofMinutes(15))   // 15-minute TTL
+        ...);
+```
+The `fleetAnalysis` cache uses a **15-minute TTL** â€” longer than the default 5-minute TTL used for other caches. One cached result serves all MANAGER/ADMIN users for 15 minutes.
+
+**Redis unavailability fallback:**
+```java
+} catch (Exception e) {
+    return new NoOpCacheManager();  // falls through to Bedrock on every call
+}
+```
+If Redis is down at startup, the `@Cacheable` annotation becomes a no-op â€” every fleet analysis call hits Bedrock directly.
+
+**Self-injection pattern (why `self.invokeBedrockCached()` instead of `this.invokeBedrockCached()`):**
+
+Spring `@Cacheable` is implemented via AOP proxy. When `analyseFleet()` calls `this.invokeBedrockCached()`, it calls the raw object directly â€” bypassing the proxy and therefore **bypassing the cache**. The fix is self-injection:
+
+```java
+@Autowired @Lazy
+private FleetAiService self;   // injects the Spring-proxied bean
+
+public FleetAnalysisResponse analyseFleet(String requestedBy) {
+    FleetAnalysisResponse result = self.invokeBedrockCached();  // hits cache
+    // ... always records audit ...
+}
+```
+
+`@Lazy` breaks the circular dependency (bean injecting itself).
+
+---
+
+### Two-method split â€” audit vs. cache
+
+| Method | Cached? | Records audit? |
+|---|---|---|
+| `analyseFleet(requestedBy)` | No | Yes â€” always writes `ai_analysis_audit` |
+| `invokeBedrockCached()` | Yes (15 min) | No |
+
+This split means: even on a cache hit, the audit record is written (who requested, when, health score, recommendation count, execution time). The audit execution time includes cache lookup latency, not Bedrock latency on a hit.
+
+---
+
+### Audit trail â€” NEW (not previously documented)
+
+Every call to `analyseFleet()` persists an `AiAnalysisAudit` record to RDS:
+
+| Column | Value |
+|---|---|
+| `requested_by` | authenticated username (from Spring Security) |
+| `requested_at` | `Instant.now()` |
+| `model` | value of `${bedrock.model-id}` property |
+| `fleet_health_score` | score from the response (0â€“100) |
+| `recommendation_count` | size of recommendations list |
+| `execution_time_ms` | wall-clock time including cache lookup |
+
+This enables compliance audit: who ran fleet analysis, how often, what health score was returned.
+
+---
+
+### Prompt engineering â€” how it's built
+
+`buildPrompt()` assembles:
+1. Role instruction: "You are a fleet maintenance advisor writing for a non-technical fleet manager."
+2. JSON schema instruction: exact JSON shape expected in the response.
+3. Fleet summary line: total vehicles, count needing service, count with insurance expiring within 30 days.
+4. Per-vehicle detail for up to **8 alert vehicles** (ACTIVE vehicles that are service-due or insurance-expiring):
+   - Vehicle number, ID, current mileage
+   - Mileage gap: "OVERDUE by X km" or "X km until service"
+   - Service date: "OVERDUE by X days" or "service due in X days (YYYY-MM-DD)"
+   - Insurance: "EXPIRED X days ago" or "expires in X days (YYYY-MM-DD)"
+
+**No cross-service call.** The prompt is built entirely from `vehicleRepository.findAll()` â€” no call to maintenance-service. This contradicts earlier documentation.
+
+---
+
+### Response schema
+
+Bedrock returns raw text (no markdown wrapper â€” the prompt instructs "Return ONLY valid JSON"). The service strips any accidental code fences:
+```java
+text = text.replaceAll("(?s)```json\\s*", "").replaceAll("(?s)```\\s*", "").trim();
+```
+
+Deserialises into `FleetAnalysisResponse`:
+```json
+{
+  "fleetHealthScore": 74,
+  "summary": "2-sentence overall fleet status and most urgent risk.",
+  "recommendations": [
+    {
+      "vehicleId": 12,
+      "vehicleNumber": "KA01AB1234",
+      "priority": "HIGH",
+      "taskType": "ROUTINE_SERVICE",
+      "action": "Schedule immediate service â€” overdue by 3,200 km",
+      "reasoning": "Vehicle has exceeded service threshold by 3,200 km...",
+      "confidence": 92
+    }
+  ]
+}
+```
+
+`FleetAnalysisResponse` implements `Serializable` (required for Redis serialisation via default Java serialiser).
+
+---
+
+### End-to-end flow â€” corrected
+
+```
+GET /api/vehicles/ai/fleet-analysis
+  â†“ JwtAuthenticationFilter â€” validates JWT, sets SecurityContext
+  â†“ @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
+  â†“ VehicleController.getFleetAiAnalysis(authentication)
+  â†“ fleetAiService.analyseFleet(authentication.getName())
+      â†“ self.invokeBedrockCached()   â† goes through Spring AOP proxy
+          â†“ Redis lookup: GET fleetAnalysis::current
+          â†“ [CACHE HIT] â†’ return cached FleetAnalysisResponse
+          â†“ [CACHE MISS] â†’
+              vehicleRepository.findAll() â†’ RDS SELECT
+              filter ACTIVE + (service-due OR insurance-expiring)
+              buildPrompt() â†’ construct ~500-token prompt
+              bedrockClient.converse(ConverseRequest) â†’ SigV4-signed HTTPS to Bedrock
+              parse JSON response â†’ FleetAnalysisResponse
+              Redis SET fleetAnalysis::current (TTL 15 min)
+              return FleetAnalysisResponse
+      â†“ record AiAnalysisAudit â†’ RDS INSERT (always, even on cache hit)
+  â†“ ResponseEntity.ok(result) â†’ JSON to client
+```
+
+---
+
+### Updated Q&A corrections
+
+**Q128 (corrected): How does vehicle-service know the maintenance history when calling Bedrock?**
+It doesn't fetch maintenance history. `FleetAiService.buildPrompt()` reads only from `vehicleRepository` â€” vehicle number, current mileage, next service mileage, next service date, insurance expiry. No call is made to maintenance-service. The prompt gives Bedrock enough context (mileage overdue, days overdue) to generate actionable recommendations without full maintenance history.
+
+**Q181 (updated): Why use Bedrock's Nova Lite model specifically?**
+`amazon.nova-lite-v1:0` is Amazon's lowest-cost, lowest-latency multimodal model â€” appropriate for real-time fleet analysis where response speed matters. The Converse API call with 2,500 max tokens typically completes in 1â€“3 seconds for the fleet prompt size (~500 input tokens). Nova Lite supports text generation, which is all the fleet advisor needs. Bedrock eliminates model infrastructure management and keeps data within the AWS account boundary.
+
+**Q280 (corrected): What is the Bedrock invocation model for FleetOps?**
+FleetOps uses the Bedrock **Converse API** (`bedrockClient.converse()`), not `InvokeModel`. The Converse API is the model-agnostic interface â€” same request/response structure regardless of underlying model. Request: `ConverseRequest` with `modelId`, `messages` (USER role, text content block), and `inferenceConfig` (maxTokens: 2500). Response: `ConverseResponse` â†’ `output().message().content().get(0).text()`. The Converse endpoint is `POST /model/{modelId}/converse`. Cost: per-token pricing (input + output tokens, billed at Nova Lite rates).
+
+**Q320 (corrected): What about Bedrock credentials in Terraform?**
+The `bedrock_access_key` and `bedrock_secret_key` variables in `prod.auto.tfvars` are legacy config â€” the current `BedrockConfig.java` does not use static credentials at runtime. `BedrockRuntimeClient` is built with either `StsAssumeRoleCredentialsProvider` (if `bedrock.role-arn` property is set) or `DefaultCredentialsProvider` (which resolves to IRSA inside the pod). The security concern about static credentials in tfvars still applies to the tfvars file itself (it should be cleaned before evaluation), but the runtime is already using the correct IRSA-based credential chain.
+
