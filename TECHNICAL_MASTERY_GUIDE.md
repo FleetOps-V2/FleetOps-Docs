@@ -4692,3 +4692,1051 @@ A: Two separate IAM roles with different permissions and trust policies:
 **Q: Why are there both `java-ci-ecr.yml` (reusable workflow) and service-specific `ci.yml` files?**
 A: The reusable workflow pattern (`.github/workflows/java-ci-ecr.yml` in `fleetops-github-workflows`) centralizes the build logic. Each service repo has a thin `ci.yml` that calls the reusable workflow with service-specific inputs (service name, SonarQube project key, ECR repo name). Benefits: one change to the build logic (e.g., add a new scanning tool) applies to all 5 services simultaneously. Without this pattern, each service would have a copy of the CI logic â€” diverging over time with inconsistent quality gates.
 
+
+
+---
+
+# PHASE 2 SUPPLEMENT â€” COST, SCALING, FAILURE MODES (All Services)
+
+## Quick Cost Reference â€” Full Stack
+
+| Service | Config | Monthly Cost (approx) |
+|---------|--------|----------------------|
+| EKS control plane | 1 cluster | $73 |
+| EC2 nodes | m7i-flex.large Ã— 2 (min) | $120 |
+| RDS PostgreSQL | db.t3.micro, 20GB | $15 |
+| ElastiCache Redis | cache.t3.micro | $14 |
+| EFS | ~10GB standard | $3 |
+| NAT Gateway | 1, ~10GB/month | $36 |
+| ALB | 1 shared, low LCU | $16 |
+| CloudFront | low traffic | $1â€“5 |
+| WAFv2 | 1 ACL, 2 rules | $8 |
+| Route53 | 1 hosted zone | $0.50 |
+| ACM | wildcard cert | $0 |
+| S3 | state + vehicle docs | $2 |
+| Secrets Manager | ~6 secrets | $2.40 |
+| SSM Parameter Store | 4 params (free tier) | $0 |
+| Lambda | 1 invocation/day | <$0.01 |
+| EventBridge | 1 rule | <$0.01 |
+| Step Functions | 6 state transitions/execution | <$1 |
+| SNS | ~1000 emails/month | $0.10 |
+| Bedrock | Nova Lite ~$0.003/1K tokens | Variable |
+| ECR | 5 repos Ã— ~500MB | $0.25 |
+| CloudTrail | management events | $0 (free tier) |
+| CloudWatch | logs, metrics | ~$5 |
+| KMS | 4 CMKs + API calls | $4 |
+| DynamoDB | lock table, PAY_PER_REQUEST | <$0.01 |
+| **Total estimate** | | **~$310â€“350/month** |
+
+---
+
+## SCALING â€” Every Service
+
+**EKS:** Control plane scales automatically (AWS managed). Worker nodes: Cluster Autoscaler scales the ASG from min 2 to max 5 m7i-flex.large nodes. For higher scale: increase max, change instance type, add multiple node groups (spot vs on-demand). EKS supports up to 5,000 nodes per cluster.
+
+**RDS:** Vertical scale: `terraform apply` with `db_instance_class = "db.t3.small"` triggers a maintenance window resize. Horizontal read scale: create read replicas, point read-heavy services at the replica endpoint. Production-grade: migrate to Aurora PostgreSQL (auto-scales storage, supports read replicas + Global Database for multi-region). Maximum connections on db.t3.micro: ~85.
+
+**Redis:** Scale vertically: change `cache.t3.micro` to `cache.r6g.large`. Horizontal: enable Cluster Mode (sharding across multiple nodes). For session management: cluster mode + multi-AZ. Current single-node: adequate for caching fleet data at this scale.
+
+**EFS:** Automatically scales â€” no provisioning needed. Standard Throughput mode scales with active usage. For heavy parallel I/O: switch to Provisioned Throughput. EFS can grow to petabytes. Multiple pods across multiple AZs can mount simultaneously (ReadWriteMany).
+
+**S3:** Infinitely scalable, no configuration. Automatically handles 5,500 GET/HEAD requests per second per prefix, 3,500 PUT/POST/DELETE per second per prefix. For high throughput: use multiple key prefixes (avoid sequential key names that hash to the same partition).
+
+**Lambda:** Scales concurrently: each invocation gets its own execution environment. Default concurrency limit: 1,000 per region (soft limit, can increase). For this daily-trigger use case: concurrency = 1. For high-frequency Lambda: configure Reserved Concurrency to guarantee capacity.
+
+**SNS:** Scales automatically to millions of messages per second. No configuration needed. SQS subscribers: add SQS queue to spread processing load. Fan-out: one SNS topic â†’ many SQS queues, each processed independently.
+
+**Step Functions:** Standard Workflows: up to 2,000 executions/second per account. Express Workflows: up to 100,000/second. Each execution is isolated. FleetOps uses Standard (default) â€” appropriate for long-running (days/weeks) approval workflows.
+
+**Bedrock:** Managed by AWS. Throttling: Nova Lite has per-minute token limits (varies by account tier). For production: request limit increase via AWS support. For high concurrency: Bedrock on-demand pricing is per-request â€” no capacity planning needed.
+
+**EventBridge:** Fully managed. Rules scale to millions of events. Rate rules: guaranteed delivery. For high volume: EventBridge Pipes or SQS buffering before Lambda.
+
+**Secrets Manager:** Auto-scales. Rate limits: 10,000 GetSecretValue requests per second per account. ESO calls once per hour per secret â€” effectively no concern.
+
+**SSM Parameter Store:** Rate limits: 40 GetParameter requests per second (standard). ESO calls once per hour. No concern.
+
+**CloudWatch:** Auto-scales. Log ingestion: unlimited. Custom metrics: 150 per account free, then $0.30/metric/month. Alarms: 10 free, then $0.10/alarm/month.
+
+**ECR:** Auto-scales. Image storage: $0.10/GB/month. Push/pull bandwidth within us-east-1: free.
+
+**ArgoCD:** Single-instance Deployment in ArgoCD namespace. For large clusters (100+ apps): increase ArgoCD controller replicas and sharding. For FleetOps scale: default 1 replica is fine.
+
+---
+
+## FAILURE MODE â€” Every Service
+
+**EFS â€” failure modes:**
+- EFS becomes unavailable: maintenance-service pods fail file upload/download endpoints (500 error). Task CRUD operations continue normally (only media ops fail).
+- NFS mount hangs: pod can get stuck waiting for I/O. Mitigation: mount option `timeo=600` (timeout) and `retrans=2`. Pod restart resolves.
+- EFS access point misconfigured (wrong UID): pods get permission denied writing files. Diagnosis: `kubectl exec` into pod and `ls -la /var/www/fleetops/shared-media`.
+
+**S3 â€” failure modes:**
+- S3 unavailable: presigned URL generation still works (local computation) but the presigned URL itself fails when browser tries to PUT. User gets upload failure.
+- KMS key disabled: `s3:PutObject` fails with `KMS key is disabled`. All existing objects can't be downloaded either. Mitigation: never disable KMS key for S3 bucket, use key deletion 30-day pending period.
+- Bucket policy misconfigured: `403 Forbidden` on presigned URL PUT. Diagnosis: check bucket policy, CORS configuration (browser PUT requires CORS headers).
+
+**Lambda â€” failure modes:**
+- Lambda function timeout (15-min max): if vehicle-service or auth-service APIs are slow, Lambda times out. EventBridge retries 2 times by default. After 3 failures: Lambda DLQ (if configured).
+- Cold start delay: first daily invocation may take 100-500ms extra. No user impact (async background job).
+- Secrets Manager throttled: Lambda `GetSecretValue` fails â†’ Lambda can't authenticate to backend â†’ all alerts for that day missed. Mitigation: Lambda caches the secret for the execution duration (reads once on cold start, reuses on warm invocations).
+- Lambda VPC vs non-VPC: FleetOps Lambda calls `origin.fleetops.website` (public URL). If Lambda is inside the VPC, it needs a NAT Gateway to reach the internet. If outside VPC (current config), it has internet access but cannot access VPC-internal resources. Trade-off is explicit.
+
+**EventBridge â€” failure modes:**
+- Rule disabled: Lambda never fires. Alerts are missed until rule is re-enabled. Mitigation: CloudWatch Alarm on Lambda invocation count dropping to 0.
+- Lambda IAM permission missing: EventBridge fires but Lambda returns 403 `AccessDenied`. `aws lambda get-policy` shows if EventBridge has invoke permission. Terraform ensures `lambda:InvokeFunction` is granted.
+
+**Step Functions â€” failure modes:**
+- State machine definition invalid (JSON syntax error): `startExecution` throws `StateMachineDoesNotExist` or `InvalidDefinition`. Caught during Terraform apply (Step Functions validates definition). Request creation fails with 500.
+- Execution timeout: Standard executions can run for 1 year. For approval workflows, the manager simply hasn't approved â€” the execution stays in `WAITING_FOR_TASK_TOKEN` state indefinitely until timeout. Configurable per state with `TimeoutSeconds`.
+- Task token lost: if request_db loses the taskToken, the execution is permanently stuck. Mitigation: store taskToken in the Step Functions execution input/output (retrievable via `DescribeExecution`).
+
+**Bedrock â€” failure modes:**
+- Model unavailable: Bedrock returns 503. vehicle-service should implement a circuit breaker (Resilience4j) â€” on 3 consecutive Bedrock failures, short-circuit and return a "AI analysis temporarily unavailable" message.
+- Token limit exceeded: Nova Lite has context window limits. Very long vehicle history prompts may fail with `ValidationException: Input too long`. Mitigation: truncate the prompt to the most recent N maintenance records.
+- IRSA credentials expired: AWS SDK auto-refreshes credentials. If STS is unavailable for the refresh, the SDK retries with exponential backoff. No action needed.
+
+**Secrets Manager â€” failure modes:**
+- Throttling: `GetSecretValue` throttled (>10,000/s). Very unlikely for this project. ESO caches secrets and only re-fetches every hour.
+- Secret deleted: ESO can no longer sync â†’ K8s Secret goes stale (last-synced value persists). Pods continue to use old value until restart. New pods may fail to start if ESO hasn't synced yet.
+- KMS key unavailable: All `GetSecretValue` calls fail (SM uses KMS to decrypt). Critical failure â€” all secrets unavailable. Mitigation: never delete KMS keys for active secrets.
+
+**ECR â€” failure modes:**
+- ECR unavailable: new image pulls fail â†’ new pods fail to start. Existing pods continue running (already pulled). Mitigation: `imagePullPolicy: IfNotPresent` on EKS nodes (images cached after first pull).
+- ECR image not found (tag deleted by lifecycle policy): rolling update fails â€” new pod can't pull image. Mitigation: lifecycle policy keeps enough `v*` tagged images. Never delete the currently-deployed tag.
+- IAM role missing ECR permissions: pull fails with `401 Unauthorized`. Node IAM role needs `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`.
+
+**CloudWatch â€” failure modes:**
+- Fluent Bit pod crash: logs stop shipping. Application continues running. Logs buffer on node filesystem until Fluent Bit restarts (DaemonSet: immediately restarted by kubelet). Position file ensures no duplicates.
+- CloudWatch API throttled: Fluent Bit backs off and retries. Log ingestion may be delayed by seconds.
+- CloudWatch Alarm not triggering: check if alarm state is `INSUFFICIENT_DATA` (metric not being reported). Diagnosis: verify CloudWatch agent is running, check for IAM issues with `cloudwatch:PutMetricData`.
+
+---
+
+# PHASE 10 SUPPLEMENT â€” COMPLETE Q&A
+
+## Top 100 General Evaluator Questions (Q48â€“Q100 + remaining)
+
+**Q48: What is the difference between synchronous and asynchronous communication in this system?**
+- Synchronous (blocking): HTTP calls between services (request-service â†’ vehicle-service to validate vehicleId). Caller waits for response. Simple but creates coupling â€” if vehicle-service is slow, request-service is slow.
+- Asynchronous (non-blocking): SNS publish (maintenance-service â†’ SNS topic). Caller fires and continues â€” does not wait for email delivery. EventBridge â†’ Lambda trigger. Step Functions waiting for task token.
+- Expert: In a production microservices system, you'd prefer async wherever possible. FleetOps mixes both deliberately: synchronous for data that's needed immediately (vehicle validation), async for side effects (alerts, workflows).
+
+**Q49: What is the CAP theorem and how does FleetOps address it?**
+- Basic: CAP = Consistency, Availability, Partition Tolerance. A distributed system can guarantee at most 2 of 3 during a network partition.
+- Deeper: FleetOps is primarily AP (Available + Partition Tolerant). The Redis cache can return stale fleet data for up to 5 minutes if the DB is being updated â€” it chooses availability over strict consistency. PostgreSQL is strongly consistent within a single instance (ACID) but there's no cross-service transaction consistency.
+- Expert: The eventual consistency gap is acknowledged: if vehicle-service updates a vehicle record and maintenance-service reads it 1 second later via its own API call, it may get the old value if caches haven't been invalidated. For the use cases here (fleet management, not financial transactions), eventual consistency is acceptable.
+
+**Q50: How does the system handle a rolling EKS upgrade (Kubernetes version 1.31 â†’ 1.32)?**
+- Basic: `terraform apply` with updated `eks_cluster_version`. EKS upgrades the control plane in-place (no downtime). Then node groups are upgraded by creating new nodes with the new AMI and draining old ones.
+- Deeper: Control plane is upgraded first. Then node group upgrade: Terraform changes the `ami_type` or `launch_template` to the new version AMI, sets force update â†’ EKS creates new node with new K8s version, cordons the old node, drains pods (graceful termination), terminates old node. Services continue during this because HPA ensures enough replicas.
+- Expert: Before upgrading: check all Helm chart compatibility with new K8s API versions (e.g., if a CRD uses a deprecated API, it breaks). Run `kubectl convert` or check Helm chart release notes. Upgrade strategy: control plane first, node groups after, always check AWS EKS release notes for deprecated APIs.
+
+**Q51: What is the "thundering herd" problem and does FleetOps have it?**
+- Vehicle-service has all pods starting simultaneously (fresh deployment). All pods have a cold Redis cache. Every request goes to PostgreSQL. This sudden DB hit is the thundering herd.
+- Mitigation: Redis TTL is set so not all cache entries expire simultaneously (slight variation in write time staggers expiry). HPA warm-up stabilization window (5 min) prevents over-scaling during startup traffic. Also: `initialDelaySeconds: 30` on readiness probe means pods don't receive traffic until warmed up.
+
+**Q52: Why does Spring Boot use Tomcat embedded rather than an external Tomcat server?**
+- Embedded Tomcat eliminates the "it works on my machine" problem â€” the server is part of the artifact. The JAR is self-contained: `java -jar app.jar`. No separate server installation, no deployment step, no WAR file. Docker images are simpler. This is the standard Spring Boot production pattern.
+
+**Q53: What is the difference between `kubectl apply` and `kubectl create`?**
+- `create`: fails if resource already exists.
+- `apply`: creates if absent, updates if present (declarative). ArgoCD exclusively uses server-side apply (`kubectl apply --server-side`) â€” it sends the desired state and the server reconciles.
+- Expert: Server-side apply uses "field management" â€” ArgoCD "owns" the fields it sets. If you manually set a field ArgoCD also manages, ArgoCD's next sync overwrites it. `selfHeal: true` enforces this continuously.
+
+**Q54: What is a Kubernetes Init Container and does FleetOps use one?**
+- Init containers run before the main container and must complete successfully. Used for: waiting for a dependency (wait for DB to be ready), data seeding, file permission setup.
+- FleetOps uses the `db-init` Job (wave 1) instead of init containers for DB creation. Could also use an init container in each service pod to verify `nc -z postgres-host 5432` before starting Spring Boot. Currently the startup probe handles this â€” if DB isn't ready, Spring Boot fails startup probe and kubelet retries.
+
+**Q55: What is the Spring Boot `@PostConstruct` annotation and how is it used in FleetOps?**
+- `@PostConstruct` methods run after Spring dependency injection completes but before the application starts serving requests. In FleetOps: `LambdaServiceInitializer.init()` is annotated `@PostConstruct`. It checks if the `lambda-service` user exists in auth_db, creates it if not. This runs once per pod startup. Idempotent â€” checks before inserting.
+
+**Q56: Why does the CI pipeline use a service container for PostgreSQL instead of an in-memory H2 database?**
+- H2 is not PostgreSQL. Flyway migrations may use PostgreSQL-specific SQL (e.g., `CREATE INDEX CONCURRENTLY`, PostgreSQL-specific data types). H2 might accept or reject these differently. JDBC URL formats differ. Spring Boot auto-configuration behaves differently with H2 vs PostgreSQL dialects.
+- Real PostgreSQL in CI guarantees: if it works in CI, it works in prod. This caught real bugs â€” H2 would have silently accepted invalid migrations.
+
+**Q57: What is the React SPA architecture and how does it interact with the backend?**
+- React 18 + Vite + TypeScript: Vite builds a static bundle (HTML + hashed JS/CSS). At runtime, all routing is client-side (React Router). The browser downloads `index.html` once, then JavaScript handles navigation without page reloads.
+- API calls: React components call the backend via `fetch()` or Axios with `Authorization: Bearer {token}`. No server-side rendering.
+- Token storage: JWT stored in browser memory (React state) or `sessionStorage` â€” cleared on tab close. Alternatively `localStorage` â€” persists across sessions but vulnerable to XSS.
+
+**Q58: What is Vite and why use it over Create React App?**
+- Vite is a next-generation build tool using ES modules natively in development (no bundling â†’ instant hot module replacement). Build uses Rollup with tree shaking. CRA uses Webpack which is slower.
+- TypeScript 5 support, CSS modules, ESBuild for fast transpilation. CRA is effectively unmaintained since 2023.
+
+**Q59: How does the frontend handle 401 Unauthorized responses?**
+- An Axios interceptor (or fetch wrapper) checks the response status. On 401: clear the JWT from memory, redirect to login page, display "Session expired" message.
+- Why: JWT expires after 24 hours. The user may have left a tab open overnight. Silent redirect prevents the user from seeing a confusing raw error.
+
+**Q60: What would you change if this were going to handle 10,000 concurrent users?**
+- RDS: Move to Aurora PostgreSQL with read replicas. Enable RDS Proxy for connection pooling.
+- Redis: Enable Cluster Mode, add Read Replicas.
+- EKS: Increase node group max to 10-20 nodes. Add dedicated node groups (application + addons).
+- ALB: Scale automatically â€” no config change needed.
+- Bedrock: Request concurrency limit increase from AWS.
+- HPA: Lower CPU target (50%) for more aggressive scale-up.
+- CDN: CloudFront already handles this at edge â€” no change needed.
+- Monitoring: Enable AWS X-Ray sampling at 100% for load testing, reduce to 5% for production.
+
+---
+
+## Top 50 AWS Questions (continued â€” Q61â€“Q110)
+
+**Q61: What is AWS Shield Standard and does FleetOps use it?**
+AWS Shield Standard is automatically enabled on all AWS accounts at no charge. It protects against layer 3/4 DDoS attacks (SYN floods, UDP floods, reflection attacks). CloudFront is a Shield Standard protected endpoint â€” global AWS infrastructure absorbs volumetric attacks before they reach the ALB. FleetOps does not explicitly configure Shield Standard (it's automatic). Shield Advanced ($3,000/month) adds DDoS response team, cost protection, layer 7 protection â€” not used in this project.
+
+**Q62: What is a VPC Endpoint and should FleetOps use one?**
+VPC Endpoints let resources in the VPC reach AWS services (S3, Secrets Manager, STS, Bedrock, etc.) without going through the internet or NAT Gateway. Currently EKS nodes reach these services via NAT Gateway â€” costs NAT bandwidth fees and adds latency.
+- Gateway endpoint (S3, DynamoDB): free. Should be added.
+- Interface endpoint (Secrets Manager, STS, ECR): ~$0.01/hour per endpoint (~$7/month). Reduces NAT costs and removes internet dependency.
+- In this project: not implemented (cost optimization â€” NAT Gateway data transfer is minimal at this scale).
+
+**Q63: What is Multi-AZ for RDS and why isn't it used here?**
+Multi-AZ RDS creates a synchronous standby replica in a second AZ. AWS automatically fails over in 60-120 seconds if the primary becomes unavailable (DB engine crash, AZ failure). Cost: doubles RDS cost (~$30/month vs $15/month for db.t3.micro).
+Not used in FleetOps: cost optimization for a training project. Production recommendation: enable Multi-AZ. Single-AZ means if the AZ goes down, the DB is unavailable and Spring Boot returns 503 until AWS recovers it (~5 min typically, up to 30 min in severe cases).
+
+**Q64: What is RDS Proxy and when would you add it?**
+RDS Proxy is a fully managed database proxy that sits between application pods and RDS. It pools connections at the proxy level (one pool shared across all app instances) instead of one HikariCP pool per pod. Benefits: handles connection bursts without exhausting max_connections, automatic failover (cuts failover time to <30s from 60-120s), IAM authentication support. Cost: 1/10 the price of the database ($1.50/month for t3.micro). Add when: connection exhaustion errors appear in logs, or enabling Multi-AZ.
+
+**Q65: What is AWS CloudFront Functions vs Lambda@Edge?**
+CloudFront Functions: JavaScript running at all 400+ edge PoPs, sub-millisecond execution, very limited runtime (no network calls, max 2MB code). Use for: URL rewrites, header manipulation, A/B testing.
+Lambda@Edge: Full Lambda runtime at a subset of PoPs (regional edge caches), up to 30s execution, can make network calls. Use for: auth at the edge, request transformation, personalization.
+FleetOps doesn't use either â€” WAF handles security filtering. If geo-blocking or auth at edge were needed, CloudFront Functions would be the starting point.
+
+**Q66: What is the difference between KMS Decrypt and KMS GenerateDataKey?**
+KMS uses envelope encryption: 
+- `GenerateDataKey`: KMS creates a data encryption key (DEK). Returns plaintext DEK (for use) + encrypted DEK (for storage alongside the data). Service uses plaintext DEK to encrypt data locally. Discards plaintext, stores encrypted DEK with data.
+- `Decrypt`: when reading data, service sends the encrypted DEK to KMS. KMS decrypts and returns the plaintext DEK. Service uses it to decrypt the data.
+S3, RDS, EFS all use this pattern internally â€” you never call these APIs directly. IRSA role has `kms:Decrypt` to allow ESO to decrypt Secrets Manager values.
+
+**Q67: What is AWS IAM Access Analyzer?**
+Access Analyzer automatically identifies resources in your account that are shared with external entities (public, cross-account). Example: if the fleetops-prod-vehicle-docs S3 bucket accidentally got a public bucket policy, Access Analyzer would flag it immediately.
+Not explicitly configured in FleetOps (`modules/config` uses AWS Config rules instead). Adding Access Analyzer is a security improvement.
+
+**Q68: What are SQS, and why is it not used in FleetOps?**
+SQS (Simple Queue Service) is a managed message queue for decoupling services. Messages are stored durably and consumed by one consumer at a time (point-to-point). SNS fan-out to SQS (SNS â†’ multiple SQS queues â†’ multiple consumers) is a common pattern.
+FleetOps uses SNS â†’ email directly. No SQS because: there's no background processing consumer â€” alerts are fire-and-forget. Adding SQS would make sense if Lambda needed to process alerts reliably (retry on failure, DLQ for failed messages). A future improvement: SNS â†’ SQS â†’ Lambda (more reliable than SNS â†’ Lambda directly, enables DLQ).
+
+**Q69: What is VPC Flow Logs and why is it not enabled?**
+VPC Flow Logs captures every network flow (source IP, dest IP, port, protocol, bytes, packets, allow/reject) from ENIs in the VPC. Stored in CloudWatch or S3.
+Not enabled in FleetOps: cost (PB of data for busy systems) and noise. Useful for security analysis (detecting unusual traffic patterns, port scans, data exfiltration). Production recommendation: enable for the EKS cluster SG at minimum, retain for 30 days in CloudWatch.
+
+**Q70: What is the difference between CloudFront HTTPS with ALB HTTPS vs CloudFront HTTPS with ALB HTTP?**
+CloudFront â†’ ALB HTTPS (end-to-end encryption): Traffic is encrypted in transit from browser to CloudFront edge AND from CloudFront to ALB. Requires ACM cert on ALB. More secure.
+CloudFront â†’ ALB HTTP: Traffic is encrypted from browser to CloudFront. CloudFront to ALB is unencrypted. Still secure from attacker's perspective (CloudFront to ALB is within AWS backbone, not internet). Slightly simpler (no cert on ALB).
+FleetOps uses HTTPS on both: CloudFront uses the ACM wildcard cert, and the ALB HTTPS listener uses the same cert (annotated in Ingress). Full end-to-end TLS.
+
+**Q71: What is AWS Compute Optimizer and what would it recommend for FleetOps?**
+Compute Optimizer analyzes CloudWatch metrics (CPU, memory, network) and recommends right-sizing for EC2 instances. For m7i-flex.large nodes: if pods consistently use < 2 vCPU, Compute Optimizer might recommend m7i-flex.medium (2 vCPU, 8GB, ~$0.03/hour cheaper). For db.t3.micro: if CPU consistently < 5%, it's right-sized; if > 80%, upgrade to db.t3.small.
+
+**Q72: What is AWS Savings Plans vs Reserved Instances for this project?**
+On-demand pricing for EKS nodes (m7i-flex.large): ~$0.19/hour = ~$137/month for 2 nodes.
+1-year Compute Savings Plan: up to 37% discount = ~$86/month for 2 nodes. Saves $51/month.
+Reserved Instance (3-year, all upfront): up to 57% off. Better savings but 3-year commitment.
+For this training project: on-demand is appropriate. Production: 1-year Savings Plan after usage stabilizes.
+
+**Q73: What is AWS CloudFormation and how does it compare to Terraform for this project?**
+CloudFormation is AWS's native IaC service. YAML/JSON templates, managed by AWS, native integration with AWS services.
+Terraform advantages over CloudFormation: multi-cloud support (not relevant here), more intuitive HCL syntax, better module ecosystem, Terraform state can be inspected/manipulated directly, Checkov supports both. 
+CloudFormation advantages: no state file to manage (AWS manages it), native rollback on failure, StackSets for multi-account deployment.
+FleetOps chose Terraform: better Kubernetes provider support (Helm, kubernetes providers), better module reuse patterns, team familiarity.
+
+**Q74: What is the AWS Well-Architected Framework and which pillars does FleetOps address?**
+5 pillars: Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization.
+- Operational Excellence: GitOps (all changes auditable, reversible), CI/CD automation, structured logging to CloudWatch.
+- Security: WAF, IRSA (no static credentials), KMS encryption for all data at rest, least-privilege IAM.
+- Reliability: Multi-AZ subnets (EKS spans 2 AZs), HPA (auto-scaling), rolling deployments (zero downtime).
+- Performance Efficiency: CloudFront CDN, Redis caching, Bedrock on-demand (no idle AI infrastructure).
+- Cost Optimization: Single NAT Gateway, shared ALB, t3.micro for DB/Redis (right-sized for training scale), Lambda for infrequent tasks.
+
+**Q75: What is Bedrock's token pricing for Nova Lite?**
+Amazon Nova Lite pricing (us-east-1): ~$0.00006 per 1,000 input tokens, ~$0.00024 per 1,000 output tokens. A typical fleet analysis prompt: ~500 input tokens + ~500 output tokens â‰ˆ $0.00015 per analysis. If the AI endpoint is called 100 times per day: $0.015/day = $0.45/month. The Redis cache reduces this by 80-90% (repeated calls for same vehicle return cached response).
+
+---
+
+## Top 50 Kubernetes Questions (continued â€” Q76â€“Q125)
+
+**Q76: What is a PersistentVolume (PV) and PersistentVolumeClaim (PVC)?**
+PV: Cluster-scoped resource representing a piece of storage (EFS, EBS, NFS). It's the actual storage resource.
+PVC: Namespace-scoped request for storage. Pod references the PVC. Kubernetes binds PVC to a matching PV.
+FleetOps EFS: The EFS CSI driver creates a PV pointing to the EFS filesystem + access point. The maintenance-service Helm chart creates a PVC with `storageClass: efs-sc`. The driver binds them. Pod mounts PVC at `/var/www/fleetops/shared-media`.
+
+**Q77: What is a StorageClass?**
+StorageClass defines how storage is dynamically provisioned. The EFS CSI driver registers a StorageClass `efs-sc` with the cluster. When a PVC references this StorageClass, the EFS CSI driver automatically creates an EFS Access Point and PV. Without dynamic provisioning, PVs would need to be created manually.
+
+**Q78: What is a Kubernetes Job vs a CronJob?**
+Job: runs one or more pods to completion, then stops. Used for one-time tasks (database migrations, data imports). The `db-init` Job in ArgoCD wave 1 is a Kubernetes Job â€” it creates databases, then exits. 
+CronJob: creates Jobs on a schedule (cron expression). FleetOps does not use a CronJob in K8s â€” instead EventBridge â†’ Lambda triggers the daily alert job outside Kubernetes. This is intentional: Lambda is more reliable (no node dependency), cheaper, and fully managed.
+
+**Q79: What is a Kubernetes Namespace and what is isolated between namespaces?**
+Namespace: a logical partition of cluster resources. Resource names must be unique within a namespace but can repeat across namespaces.
+What IS isolated: names, RBAC scopes, NetworkPolicy (can scope to namespace), resource quotas, LimitRanges.
+What is NOT isolated: nodes (pods from all namespaces share the same nodes â€” unless node affinity/taints), cluster DNS (cross-namespace calls work), network traffic (without NetworkPolicy, pods from any namespace can reach any pod).
+FleetOps namespaces: `fleetops-prod` (app pods), `argocd` (ArgoCD), `kube-system` (cluster addons), `amazon-cloudwatch` (CloudWatch agent), `external-secrets` (ESO).
+
+**Q80: What is a Kubernetes LimitRange?**
+LimitRange sets default and maximum resource requests/limits for containers in a namespace. If a pod spec omits `resources.requests`, LimitRange applies defaults.
+Without LimitRange: a pod with no resource requests can consume all node resources (starving other pods). The HPA also needs resource requests to calculate utilization percentages.
+FleetOps: LimitRange not explicitly configured â€” each service's Helm chart specifies resources explicitly. Production: add LimitRange as a safety net.
+
+**Q81: What is a Kubernetes ResourceQuota?**
+ResourceQuota limits total resource consumption within a namespace. Example: `requests.cpu: 4000m` (namespace gets max 4 vCPU total). Prevents a single namespace from monopolizing cluster resources.
+FleetOps: ResourceQuota not configured. Production multi-tenant: add quotas to prevent one team's services from starving another's.
+
+**Q82: What is the difference between a Helm value override file (`values-prod.yaml`) and the base `values.yaml`?**
+`values.yaml`: default values â€” work for any environment. Contains relative defaults (image tag: latest, replicas: 1).
+`values-prod.yaml`: environment-specific overrides. Contains: prod image tag (v1.3.0), replicas: 2, prod RDS endpoint, prod EFS filesystem ID.
+ArgoCD applies both: base `values.yaml` first, then `values-prod.yaml` overrides on top. Anything in `values-prod.yaml` wins.
+
+**Q83: What happens if a pod is evicted?**
+Eviction occurs when a node is under memory pressure. kubelet kills pods with `BestEffort` QoS (no resource requests set) first, then `Burstable` (requests < limits), then `Guaranteed` (requests == limits).
+FleetOps pods: `Burstable` QoS (limits higher than requests). If the node OOMs, FleetOps pods may be evicted.
+Evicted pod: rescheduled by the scheduler on another node. If all nodes are full, the pod goes Pending until Cluster Autoscaler adds a node.
+Mitigation: set `requests == limits` for critical services (Guaranteed QoS, never evicted). Trade-off: less efficient bin packing.
+
+**Q84: What is the difference between `kubectl delete pod` and `kubectl rollout restart`?**
+`kubectl delete pod auth-service-abc123`: deletes one specific pod. ReplicaSet controller immediately creates a replacement. Useful for: forcing a specific pod to restart. Does NOT guarantee new pods use a new image.
+`kubectl rollout restart deployment/auth-service`: triggers a rolling update with a new `kubectl.kubernetes.io/restartedAt` annotation. ALL pods are replaced in rolling update order (maxSurge/maxUnavailable). Used for: config reload, forcing a fresh IRSA token, applying updated Secrets (ESO just synced).
+
+**Q85: What is the purpose of `kubernetes.io/cluster/{cluster-name}: owned` tag on subnets?**
+EKS uses this tag to discover which subnets belong to the cluster. The AWS Load Balancer Controller uses it to auto-discover subnets for ALB placement: `kubernetes.io/role/elb=1` = public (internet-facing ALB), `kubernetes.io/role/internal-elb=1` = private (internal ALB). Without these tags, the LBC cannot create ALBs automatically and the Ingress would stay in a broken state.
+
+**Q86: What is a Kubernetes Admission Controller?**
+Admission controllers intercept API requests AFTER authentication and authorization but BEFORE objects are persisted to etcd. Types:
+- Mutating: modify the request (e.g., inject sidecar containers, add default values)
+- Validating: allow or reject based on custom rules
+
+FleetOps uses admission controllers:
+- EKS Pod Identity Webhook (MutatingAdmissionWebhook): injects IRSA env vars + projected token volume into pods with annotated ServiceAccounts
+- ALB Controller's ValidatingWebhookConfiguration: validates Ingress resources before accepting
+
+**Q87: What is `kubectl port-forward` and when would you use it for debugging?**
+`kubectl port-forward pod/auth-service-abc123 8080:8080`: forwards local port 8080 to the pod's port 8080 via the Kubernetes API server tunnel. No ALB, no CloudFront â€” direct access to the pod. Used for: debugging a specific pod, testing actuator endpoints, checking DB connection from inside a pod.
+`kubectl port-forward service/fleetops-auth-service 8080:8080`: load-balances across all service pods.
+
+**Q88: What is the EKS node bootstrap script and what does it configure?**
+EKS managed nodes run the EKS-optimized Amazon Linux 2 AMI. The AMI includes: containerd, kubelet, kubectl, the AWS VPC CNI DaemonSet. The bootstrap script (`/etc/eks/bootstrap.sh`) configures:
+- Kubelet arguments (`--node-labels`, `--max-pods` based on instance type)
+- Cluster endpoint (so kubelet knows where to register)
+- CA data (for TLS verification of API server)
+- `--container-runtime containerd` (replaces Docker daemon)
+
+**Q89: What is the difference between horizontal and vertical pod autoscaling?**
+HPA (Horizontal Pod Autoscaler): adds more pod replicas when load increases. Scale-out. Requires stateless pods (FleetOps pods are stateless â€” sessions in Redis/DB, not pod memory).
+VPA (Vertical Pod Autoscaler): adjusts resource requests/limits based on actual usage. Scale-up. Pod must be restarted to apply new requests. Not installed in FleetOps â€” HPA is sufficient.
+For stateful workloads (databases): vertical scaling is typically preferred (more resources on same instance) vs horizontal (data sharding is complex).
+
+**Q90: What is a Pod Disruption Budget (PDB)?**
+PDB limits how many pods can be voluntarily disrupted simultaneously. `minAvailable: 1` means Kubernetes won't drain/evict more pods than would leave fewer than 1 available.
+Used by: Cluster Autoscaler scale-down (won't evict the last pod of a deployment), `kubectl drain` (respects PDB).
+FleetOps: PDB not explicitly configured. With HPA `minReplicas: 2`, there are always 2 pods â€” the Cluster Autoscaler won't evict both simultaneously. Adding `minAvailable: 1` PDB would enforce this formally.
+
+---
+
+## Top 50 Terraform Questions (continued â€” Q91â€“Q140)
+
+**Q91: What is `terraform output` and when is it useful?**
+`terraform output` prints values declared in `outputs.tf` to stdout. Used in CI/CD:
+```bash
+CERT_ARN=$(terraform output -raw acm_certificate_arn)
+EFS_ID=$(terraform output -raw efs_filesystem_id)
+```
+In `terraform-apply.yml`, outputs are extracted and written to `infra-values.yaml` in the deployments repo. Helm charts read this file to get infrastructure-specific values (ACM cert ARN for ALB annotation).
+
+**Q92: What is a Terraform `data` source?**
+Data sources read existing (pre-existing) AWS resources without creating them. Example in FleetOps:
+```hcl
+data "aws_lb" "fleetops" {
+  tags = { "elbv2.k8s.aws/cluster" = module.eks_cluster.cluster_name }
+}
+```
+After the ALB is created by the LBC controller, this data source fetches the ALB's DNS name to create Route53 alias records. It reads, never creates. `depends_on = [module.eks_addons]` ensures the ALB exists before the data source tries to read it.
+
+**Q93: What is the Terraform `try()` function and why is it used in the providers?**
+```hcl
+host = try(module.eks_cluster.cluster_endpoint, "")
+```
+`try()` evaluates the expression and returns the fallback (`""`) if the first argument would cause an error (e.g., if `module.eks_cluster` hasn't run yet and the output doesn't exist).
+This prevents Terraform from failing during `terraform init` or `terraform plan` before EKS exists. The helm/kubernetes providers need an endpoint, but during first apply the cluster doesn't exist yet â€” `try()` returns `""` and the provider skips validation.
+
+**Q94: What is the Terraform `for_each` meta-argument?**
+Creates multiple instances of a resource from a map or set. Example:
+```hcl
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.fleetops.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+  name    = each.value.name
+  records = [each.value.record]
+  type    = each.value.type
+}
+```
+One `aws_route53_record` per domain validation option in the ACM certificate. More idiomatic than `count` because instances are addressed by key (`each.key`) not index â€” adding/removing a domain doesn't shift indices.
+
+**Q95: What is `terraform validate` vs `terraform plan`?**
+`validate`: static analysis only â€” checks syntax, type compatibility, variable references. Does NOT call AWS APIs. Fast (~1s). Run before plan to catch obvious errors.
+`plan`: calls AWS APIs to get current state, evaluates the full diff. Requires valid AWS credentials. Much slower but gives complete picture.
+In CI: `validate` runs first (fast gate), then `plan` (requires OIDC auth, slower).
+
+**Q96: What is `terraform fmt` and why does CI enforce it?**
+`terraform fmt` reformats .tf files to canonical HCL style (consistent indentation, aligned equals signs). `-check` mode exits non-zero if any file needs reformatting. In CI, this enforces consistent code style without needing code review comments. Pre-commit hooks can also run `terraform fmt` automatically before commit.
+
+**Q97: What is `terraform taint` and when was it used?**
+`terraform taint` (deprecated in Terraform 1.x, replaced by `-replace`) marks a resource for forced recreation on next apply. Use case: an EC2 instance is stuck in a bad state that Terraform's update can't fix, but a fresh instance would work. In Terraform 1.x: `terraform apply -replace=module.eks_nodegroup.aws_launch_template.main`.
+FleetOps: would use this if a node group launch template gets corrupted and needs fresh recreation.
+
+**Q98: What is the `random` provider used for in FleetOps?**
+The `random` provider generates random values. Typical use: suffix for globally unique resource names:
+```hcl
+resource "random_string" "bucket_suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+resource "aws_s3_bucket" "state" {
+  bucket = "fleetops-terraform-state-${random_string.bucket_suffix.result}"
+}
+```
+S3 bucket names are globally unique â€” appending a random suffix prevents naming conflicts across accounts. The random value is stored in state and doesn't change on re-apply.
+
+**Q99: What is the `archive` provider used for?**
+The `archive` provider creates ZIP files from source directories. Used by the Lambda module:
+```hcl
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/src"
+  output_path = "${path.module}/lambda.zip"
+}
+resource "aws_lambda_function" "alert_processor" {
+  filename      = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+}
+```
+`source_code_hash` ensures Lambda updates when source code changes (Terraform detects hash mismatch and triggers a Lambda update).
+
+**Q100: What is `terraform state mv` and when would you use it?**
+`terraform state mv` moves a resource from one state address to another without recreating it. Use cases:
+- Rename a resource in code: `aws_security_group.alb` â†’ `aws_security_group.load_balancer`
+- Move a resource into a module: `aws_vpc.main` â†’ `module.networking.aws_vpc.main`
+- Split a module into sub-modules
+Without `state mv`, Terraform would destroy the old resource and create a new one â€” catastrophic for resources like RDS.
+
+**Q101: What is a Terraform `moved` block (Terraform 1.1+)?**
+A safer alternative to `terraform state mv` â€” declarative in .tf code:
+```hcl
+moved {
+  from = aws_security_group.alb
+  to   = module.networking.aws_security_group.alb
+}
+```
+This is committed to the repository and applied automatically on next `terraform apply`. Prevents teammates from accidentally recreating moved resources.
+
+**Q102: What is `terraform refresh-only` vs the old `terraform refresh`?**
+`terraform refresh` (deprecated) updated the state to match reality without showing changes. `terraform apply -refresh-only` achieves the same but shows a plan of state changes first (review before committing). Use when: someone manually modified an AWS resource and you want to accept the change into state without reverting it.
+Example: manually added a tag to an RDS instance. `apply -refresh-only` accepts the tag in state. Next `terraform plan` will still show the tag as a diff to remove (because your .tf code doesn't have it) â€” you must also add it to .tf to make it stable.
+
+**Q103: What is the `tls` provider used for in FleetOps?**
+The `tls` provider can generate TLS certificates and keys. In the EKS OIDC module, it may be used to fetch the OIDC endpoint's TLS certificate thumbprint:
+```hcl
+data "tls_certificate" "eks_oidc" {
+  url = module.eks_cluster.oidc_issuer_url
+}
+resource "aws_iam_openid_connect_provider" "eks" {
+  thumbprint_list = [data.tls_certificate.eks_oidc.certificates[0].sha1_fingerprint]
+}
+```
+The thumbprint tells IAM which CA issued the OIDC endpoint's certificate â€” used to verify JWT signatures.
+
+**Q104: What is `terraform graph` and what does it show?**
+`terraform graph | dot -Tsvg > graph.svg`: generates a DOT-format dependency graph visualization. Shows all resources as nodes, dependencies as directed edges. Useful for: understanding why an apply fails (which dependency is blocking), visualizing the module structure, identifying circular dependencies.
+For FleetOps, the graph would show: kms â†’ (networking, rds, redis, s3, efs, secrets_manager) â†’ eks_cluster â†’ eks_oidc â†’ (iam, eks_nodegroup) â†’ eks_addons â†’ (lambda, cloudwatch, etc.).
+
+**Q105: What happens during `terraform init` in CI?**
+```
+terraform init:
+  1. Downloads providers (aws, helm, kubernetes, random, tls, archive) from Terraform Registry
+     Cached in .terraform/providers/ (GitHub Actions can cache this directory)
+  2. Downloads modules (all local modules are relative paths, no download needed)
+  3. Configures the S3 backend:
+     - Reads bucket/key/region from backend block
+     - Authenticates with AWS (OIDC credentials from configure-aws-credentials)
+     - Verifies bucket exists and is accessible
+     - Checks/creates the state file if absent
+  4. Generates .terraform.lock.hcl with provider version hashes
+     (ensures reproducible builds â€” same versions every run)
+```
+
+---
+
+## Top 50 CI/CD Questions (continued â€” Q106â€“Q155)
+
+**Q106: What is a GitHub Actions composite action?**
+A composite action bundles multiple steps into a reusable unit. The `configure-aws-credentials@v4` action is a composite action â€” it internally handles OIDC token fetching, STS call, and env var setting. FleetOps could extract common steps (like semantic version calculation) into a composite action stored in the `fleetops-github-workflows` repo. Currently, reusable workflows cover most of this.
+
+**Q107: What is the GitHub Actions `concurrency` key?**
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+```
+If two pushes to the same branch trigger CI, `concurrency` decides whether the second run waits for the first (`cancel-in-progress: false`) or cancels the first (`cancel-in-progress: true`). 
+For CI (build, test, push): `cancel-in-progress: true` â€” no point testing the old commit if a new one is ready.
+For CD (deploy): `cancel-in-progress: false` â€” never cancel a deployment mid-way (could leave cluster in inconsistent state).
+
+**Q108: What is the difference between `actions/checkout@v4` with `fetch-depth: 0` vs `fetch-depth: 1`?**
+`fetch-depth: 1` (default): shallow clone, only the latest commit. Fast but no git history.
+`fetch-depth: 0`: full history, all tags. Required for semantic versioning â€” `git describe --tags --abbrev=0` needs to find the last tag, which may be many commits back. The CI `prepare` job uses `fetch-depth: 0` to correctly calculate version bumps since the last tag.
+
+**Q109: How does the GitHub Actions `needs` context work?**
+```yaml
+jobs:
+  build:
+    needs: [prepare, quality]
+    steps:
+    - name: Get tag from prepare job
+      run: echo "TAG=${{ needs.prepare.outputs.image-tag }}"
+```
+`needs` creates a dependency and provides access to the outputs of the specified jobs via `needs.<job>.outputs.<output-name>`. The `build` job waits for both `prepare` and `quality` to succeed, then reads the `image-tag` output from `prepare`.
+
+**Q110: What is `docker/setup-buildx-action` and why is it needed?**
+Docker Buildx is not enabled by default on GitHub Actions runners. `docker/setup-buildx-action@v3` installs the Buildx driver (Docker containerd driver or docker-container driver). Required to use `docker/build-push-action@v5` with advanced features (GHA cache, multi-platform, BuildKit). Without it, only basic `docker build` works.
+
+**Q111: What is the `GITHUB_OUTPUT` environment variable?**
+The mechanism for passing data between steps in the same job:
+```bash
+echo "image-tag=${TAG}" >> $GITHUB_OUTPUT
+```
+Then in a later step or dependent job:
+```yaml
+run: echo "${{ steps.compute-tag.outputs.image-tag }}"
+```
+Old method (deprecated): `::set-output name=tag::value` (vulnerable to injection if value contained newlines). `GITHUB_OUTPUT` writes to a file, eliminating injection risk.
+
+**Q112: How does the `workflow_run` download artifact mechanism work?**
+CI workflow uploads the image tar as an artifact:
+```yaml
+- uses: actions/upload-artifact@v4
+  with:
+    name: docker-image
+    path: /tmp/image.tar
+```
+CD or trivy-scan job downloads it:
+```yaml
+- uses: actions/download-artifact@v4
+  with:
+    name: docker-image
+    run-id: ${{ github.event.workflow_run.id }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+The `run-id` references the specific CI run that produced the artifact. `GITHUB_TOKEN` authenticates the download (artifacts are private to the repo).
+
+**Q113: What is branch protection and how does it enforce the CI pipeline?**
+Branch protection rules on the `main` branch:
+- Require status checks to pass before merging: `CI Pipeline / quality`, `CI Pipeline / trivy-scan`
+- Require branches to be up to date before merging
+- Dismiss stale pull request approvals when new commits are pushed
+
+This means a PR cannot be merged to `main` unless CI passes. Direct pushes to `main` are blocked. This enforces: all code on `main` has passed tests, SonarQube, and Trivy scan.
+
+**Q114: What is a GitHub Environment and how is it different from a branch?**
+A GitHub Environment (Settings â†’ Environments â†’ "production") is a named deployment target with optional protection rules:
+- Required reviewers: specific users/teams must approve before the job runs
+- Wait timer: delay N minutes after trigger before running
+- Deployment branches: only allow deployments from specific branches
+The CD workflow's `environment: production` job is gated by the production environment's protection rules. If "Required reviewers" is set, the job pauses and emails the reviewers.
+
+**Q115: What is `actions/cache@v4` and how does it work?**
+GitHub Actions cache stores files between workflow runs for the same branch. Cache key determines when the cache is used vs. refreshed:
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: ~/.m2/repository
+    key: maven-${{ hashFiles('**/pom.xml') }}
+    restore-keys: maven-
+```
+On hit: downloads cached ~/.m2. On miss: `restore-keys: maven-` finds the most recent maven-* cache (partial match) â€” still useful, just slightly stale.
+Cache is stored in GitHub's Azure Blob Storage backend. Max 10GB per repo, 7-day expiry on unused caches.
+
+---
+
+## Top 50 Security Questions (continued â€” Q116â€“Q165)
+
+**Q116: What is BCrypt and why use strength 10?**
+BCrypt is an adaptive password hashing function. Strength (work factor) 10 means 2^10 = 1,024 iterations of the internal KDF. This makes brute-force and dictionary attacks expensive.
+At strength 10: hashing one password takes ~100ms on modern hardware. An attacker can only try 10 hashes/second per CPU core. At strength 12: ~400ms (more secure, but login takes 400ms).
+BCrypt advantages over MD5/SHA: designed specifically for passwords, salted (no rainbow table attacks), adaptive (increase strength as hardware improves). Spring Security BCryptPasswordEncoder default strength is 10.
+
+**Q117: What is JWT and why use HS256 vs RS256 for signing?**
+JWT (JSON Web Token) is a compact, signed token format. Header.Payload.Signature.
+HS256 (HMAC-SHA256): symmetric â€” uses one secret key for both signing and verification. Simple, fast. Requires every service that validates JWTs to have the secret.
+RS256 (RSA-SHA256): asymmetric â€” private key signs, public key verifies. Services can verify tokens with the public key without access to the private key (more secure for multi-service architectures).
+FleetOps uses HS256 with a shared `JWT_SECRET`. Acceptable for this architecture since all services are internal. Production improvement: use RS256 â€” auth-service holds the private key, other services verify with the public key (no secret sharing needed).
+
+**Q118: What is XSS (Cross-Site Scripting) and how does FleetOps prevent it?**
+XSS: attacker injects malicious JavaScript into the page. If JWT is in `localStorage`, the malicious script can steal it: `localStorage.getItem('token')`.
+Prevention:
+- ContentSecurityPolicy (CSP) header: whitelist which scripts are allowed to run
+- Spring Boot response headers: `X-XSS-Protection`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+- React's JSX: automatically escapes dynamic values (`{userInput}` is rendered as text, not HTML)
+- JWT in httpOnly cookie: inaccessible to JavaScript
+FleetOps security backlog item: move JWT from localStorage to httpOnly cookie.
+
+**Q119: What is CSRF (Cross-Site Request Forgery) and does FleetOps have it?**
+CSRF: malicious website tricks the user's browser into making an authenticated request to fleetops.website.
+FleetOps mitigation: JWT in Authorization header. Browsers never automatically send Authorization headers (they auto-send cookies). So CSRF is not applicable to JWT-based auth. If FleetOps moved to httpOnly cookie, CSRF protection (SameSite=Strict, CSRF token) would be needed.
+
+**Q120: What is SQL injection and how does Spring JPA prevent it?**
+SQL injection: attacker injects SQL code via user input: `' OR '1'='1`.
+Spring Data JPA with parameterized queries:
+```java
+// SAFE (Spring JPA)
+vehicleRepository.findByLicensePlate(licensePlate);  
+// Generates: SELECT * FROM vehicles WHERE license_plate = ? with params
+
+// UNSAFE (would be):
+entityManager.createNativeQuery("SELECT * FROM vehicles WHERE plate = '" + plate + "'");
+```
+JPA uses PreparedStatements automatically â€” values are always parameters, never interpolated into the SQL string. Injection is impossible.
+
+**Q121: What is HTTPS and why is HTTP disabled entirely in FleetOps?**
+HTTPS = HTTP over TLS. Encrypts the connection between browser and server. Without HTTPS:
+- Passwords sent in plaintext (anyone on the network can see them)
+- JWT tokens interceptable (session hijacking)
+- Man-in-the-middle attacks possible
+
+FleetOps: CloudFront enforces HTTPS-only. The ALB listener redirect (80 â†’ 443) via `ssl-redirect: "443"` annotation. Spring Boot itself doesn't need SSL termination (CloudFront/ALB handle it).
+
+**Q122: What is a security group's "stateful" behavior and why does it matter?**
+Stateful: if you allow inbound traffic on port 8080, the reply traffic is automatically allowed outbound â€” you don't need an explicit outbound rule for the return traffic.
+Example: ALB SG allows inbound 443 from 0.0.0.0/0. When ALB makes a connection to a pod on 8080, the pod's response (on ephemeral ports 1024-65535) is automatically allowed back through the ALB SG.
+Contrast with NACLs (Network Access Control Lists): stateless â€” must explicitly allow both directions.
+
+**Q123: What is container image scanning and what does Trivy find that Snyk misses?**
+Snyk (in CI quality job): scans Maven pom.xml for dependency CVEs. Only checks Java dependencies declared in pom.xml.
+Trivy (in CI trivy-scan job): scans the BUILT IMAGE. Finds:
+- OS-level CVEs: vulnerabilities in Alpine Linux packages (openssl, glibc, musl) â€” not detectable from pom.xml
+- All JAR CVEs: including transitive dependencies not explicitly in pom.xml
+- Java runtime CVEs: JDK/JRE vulnerabilities in the base image
+Trivy catches what Snyk misses: OS packages and base image vulnerabilities.
+
+**Q124: What is the principle of least privilege and how is it implemented in FleetOps?**
+Least privilege: grant only the minimum permissions required.
+- IRSA `fleetops-app` role: `secretsmanager:GetSecretValue` only on `fleetops/*` ARNs (not all secrets in the account)
+- SNS publish: only on `arn:aws:sns:us-east-1:538661800892:fleetops-*` (not all topics)
+- S3: only `fleetops-prod-vehicle-docs` bucket (not `s3:*`)
+- ECR push role: only `ecr:PutImage`, `ecr:InitiateLayerUpload` etc (not `iam:*` or `ec2:*`)
+Known violation: `fleetops-app` ServiceAccount is shared across all services â€” auth-service has Bedrock permissions it doesn't need. Fix: separate IRSA roles per service.
+
+**Q125: What is the AWS Security Token Service (STS) and when does FleetOps call it?**
+STS issues temporary security credentials. FleetOps calls STS in three places:
+1. IRSA: pods call `sts:AssumeRoleWithWebIdentity` to get 1-hour credentials for AWS SDK calls
+2. GitHub Actions OIDC: CI/CD runner calls `sts:AssumeRoleWithWebIdentity` to get credentials for ECR push or Terraform apply
+3. kubectl auth: GitHub Actions runs `aws eks get-token` which calls `sts:GetCallerIdentity` to generate a pre-signed STS URL used as a K8s bearer token
+All three use OIDC identity tokens â€” no static credentials anywhere.
+
+**Q126: What is AWS Config's `restricted-ssh` rule?**
+AWS Config Managed Rule: checks that no security group allows unrestricted SSH access (port 22, 0.0.0.0/0). FleetOps EKS nodes never have port 22 open (managed nodes, no SSH). AWS Config would report these as COMPLIANT.
+Access to EKS nodes: use AWS Systems Manager Session Manager (SSM) â€” creates a secure shell session through the SSM agent without port 22. The node IAM role has `AmazonSSMManagedInstanceCore` policy for this.
+
+**Q127: What would a security penetration tester look for in FleetOps?**
+- JWT localStorage storage: XSS vulnerability
+- Shared `fleetops-app` IRSA role: over-privileged pods
+- Plaintext secrets in `terraform.tfvars`: plaintext db_password, jwt_secret (security backlog)
+- Single NAT Gateway: not HA but not a security issue
+- Single-AZ RDS: availability issue, not security
+- No WAF logging: WAF blocks requests but doesn't log blocked requests to CloudWatch (improvement: enable WAF logging to S3)
+- No VPC Flow Logs: can't investigate network anomalies post-incident
+- ArgoCD exposed publicly (argocd.fleetops.website): properly secured with admin password, but publicly reachable (improvement: put behind VPN or restrict to office IPs)
+
+---
+
+## Top 50 Project-Specific Questions (continued â€” Q128â€“Q177)
+
+**Q128: How does vehicle-service know the maintenance history when calling Bedrock?**
+vehicle-service makes an internal HTTP call to maintenance-service to fetch maintenance records for that vehicle before building the Bedrock prompt:
+```java
+List<MaintenanceTask> history = maintenanceServiceClient.getTasksByVehicleId(vehicleId);
+String prompt = buildPrompt(vehicle, history);
+bedrockClient.converse(buildConverseRequest(prompt));
+```
+This is a synchronous service-to-service call using the vehicle's Bearer token (or a service account token) for auth. The call goes through CoreDNS â†’ ClusterIP â†’ maintenance-service pod (not through the ALB or internet).
+
+**Q129: What is the `LambdaServiceInitializer` and why is it needed?**
+Lambda cannot access Kubernetes-internal services (it's outside the cluster). It must call the auth-service via the public URL (`origin.fleetops.website`). To authenticate, it needs a service account in auth-service.
+`LambdaServiceInitializer` is a Spring `@Component` with `@PostConstruct`. On every auth-service pod startup:
+1. Check: `SELECT COUNT(*) FROM users WHERE username = 'lambda-service'`
+2. If 0: create the user with role TECHNICIAN and password from `LAMBDA_SERVICE_PASSWORD` env var
+3. If exists: skip
+This is idempotent â€” no-op if the user already exists.
+
+**Q130: Why is the db-init Job in sync wave 1 and not wave 0?**
+Wave 0: platform (namespace, RBAC, ServiceAccount) and secrets (ExternalSecrets) must exist first.
+The db-init Job needs:
+- The `fleetops-prod` namespace (wave 0) to run in
+- The `fleetops-postgres-secret` K8s Secret (wave 0) for DB credentials
+- PostgreSQL must be reachable (RDS always reachable â€” not an ArgoCD concern)
+Wave 1 ensures namespace and secrets exist before db-init tries to connect and create databases. If wave 0 is skipped, db-init can't read the secret and fails.
+
+**Q131: How does the frontend React app make authenticated API calls?**
+```typescript
+// axios interceptor pattern (in api.ts or a custom hook)
+const axiosInstance = axios.create({
+  baseURL: 'https://fleetops.website',
+});
+
+axiosInstance.interceptors.request.use((config) => {
+  const token = getToken(); // from React state / sessionStorage
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+axiosInstance.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      clearToken();
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+```
+Every API call automatically has the JWT. 401 responses redirect to login.
+
+**Q132: What is the difference between `ROLE_MANAGER` and `MANAGER` in Spring Security?**
+Spring Security convention: `GrantedAuthority` objects prefixed with `ROLE_` are treated as roles. When you use `hasRole('MANAGER')`, Spring Security checks for authority `ROLE_MANAGER`.
+In the JWT, roles are stored as: `["ROLE_MANAGER", "ROLE_TECHNICIAN"]`. When Spring Security parses the JWT and creates `SimpleGrantedAuthority` objects, the `ROLE_` prefix is already there.
+`@PreAuthorize("hasRole('MANAGER')")` â†’ Spring looks for `ROLE_MANAGER` âœ“
+`@PreAuthorize("hasAuthority('ROLE_MANAGER')")` â†’ also works (more explicit)
+
+**Q133: How does the CloudFront distribution know to NOT cache `/api/*` responses?**
+In `modules/cloudfront`, the distribution has a cache behavior:
+```hcl
+ordered_cache_behavior {
+  path_pattern = "/api/*"
+  forwarded_values {
+    query_string = true
+    headers      = ["Authorization", "Content-Type"]
+  }
+  min_ttl     = 0
+  default_ttl = 0
+  max_ttl     = 0
+  viewer_protocol_policy = "redirect-to-https"
+}
+```
+TTL of 0 = never cache. The Authorization header is forwarded to the origin (ALB) â€” if CloudFront cached API responses, it would cache per Authorization header (one cache entry per user), which is both expensive and incorrect.
+
+**Q134: What is the ArgoCD `repoURL` and how does ArgoCD authenticate to it?**
+`repoURL: https://github.com/FleetOps-V2/fleetops-deployments.git`
+ArgoCD authenticates using the secret `argocd-repo-fleetops-deployments` created by Terraform (`modules/eks/addons`). This secret contains the GitHub PAT stored in Secrets Manager. Type: `repository` secret, which ArgoCD recognizes and uses for Git operations:
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argocd-repo-fleetops-deployments
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+data:
+  type: Z2l0  # "git" base64
+  url: aHR0cHM6Ly9naXRodWIuY29tL0ZsZWV0T3BzLVYyL2ZsZWV0b3BzLWRlcGxveW1lbnRzLmdpdA==
+  username: dXNlcm5hbWU=  # "username"
+  password: <PAT base64>
+```
+
+**Q135: What is Helm's `helm template` command and how does ArgoCD use it?**
+`helm template release-name ./chart -f values.yaml -f values-prod.yaml` renders the chart templates (Go templates) to plain Kubernetes YAML. ArgoCD runs this internally (via the Helm library) before comparing rendered YAML to live cluster state. This is why ArgoCD can do diffing even for Helm-deployed apps â€” it always works with rendered YAML, not Helm release state.
+
+**Q136: Why does FleetOps not use ArgoCD's Application health for RDS/Redis?**
+ArgoCD only manages Kubernetes resources. It has no concept of AWS resources. RDS, Redis, EFS health are checked by:
+- Spring Boot Actuator: `/actuator/health` checks DB and Redis from inside the pod
+- ALB health check: uses `/actuator/health` to determine pod readiness
+- CloudWatch Alarms: monitors RDS CPU, Redis memory directly
+ArgoCD sees the pods as Healthy (Deployment has desired replicas Ready). The DB health is implicit â€” if DB is down, pods fail startup probes and are not Ready, so ArgoCD shows Deployment as Degraded.
+
+**Q137: What is the `@Scheduled` annotation in maintenance-service and how does it work?**
+```java
+@Scheduled(cron="0 0 8 * * ?")  // 8am every day, server timezone
+public void scanAndBroadcastAlerts() {
+    alarmBroadcastService.scanAndBroadcast();
+}
+```
+Spring's `@EnableScheduling` starts a scheduled task executor. `@Scheduled` registers the method in the executor's cron scheduler. The pod where this task runs depends on which pod the scheduler happens to be on.
+Critical issue with replicas: with 2+ maintenance-service replicas, BOTH pods will execute this cron at 8am. This causes duplicate SNS alerts!
+Mitigation: implement distributed locking (ShedLock, using the DB as a lock store), or use a Kubernetes CronJob (only one pod runs), or use the EventBridge Lambda approach (external scheduler triggers one Lambda).
+
+**Q138: How does the infra-values.yaml bridge Terraform and ArgoCD?**
+Chicken-and-egg problem: ArgoCD needs the ACM cert ARN for the Ingress annotation, but ACM cert ARN is only known after `terraform apply`. Solution:
+1. Terraform applies â†’ extracts outputs: `terraform output -raw acm_certificate_arn`
+2. Terraform CI writes `environments/prod/infra-values.yaml` with these values
+3. Terraform CI commits and pushes this file to `fleetops-deployments` repo
+4. ArgoCD syncs `fleetops-deployments` â†’ reads `infra-values.yaml` as an additional Helm values file
+5. Helm chart substitutes `{{ .Values.infrastructure.acmCertificateArn }}` into the Ingress annotation
+
+**Q139: What is the `allowEmpty: false` argocd syncOption?**
+If a Helm chart renders to ZERO resources (e.g., all resources gated by `if .Values.enabled` and all are false), ArgoCD by default would apply the empty set â€” effectively deleting everything. `allowEmpty: false` prevents this: ArgoCD refuses to sync if the rendered output is empty. This catches template errors before they cause an outage.
+
+**Q140: What monitoring would immediately alert you if a deployment went bad?**
+1. ALB 5xx error rate CloudWatch Alarm: if new pods are crashing, ALB gets 502 (bad gateway) or 503 (service unavailable). Alarm fires within 5 minutes.
+2. Spring Boot Actuator + ALB health check: pods failing health checks are removed from target group â†’ ALB continues routing to healthy pods. If ALL pods fail â†’ ALB 503 â†’ CloudWatch alarm.
+3. CD workflow smoke test: 90s after deployment, curl the health endpoint. `HTTP 5xx` or connection refused fails the CD job and sends a notification.
+4. ArgoCD sync status: if pods never reach Healthy state, ArgoCD shows app as Degraded.
+
+**Q141: How would you implement blue-green deployment for FleetOps instead of rolling?**
+Current: rolling (old and new pods mix during update).
+Blue-Green: two identical environments (blue = current, green = new).
+Implementation with ArgoCD + ALB:
+1. Deploy green version alongside blue (separate Deployment with `-green` suffix)
+2. Test green with a subset of traffic or internal testing
+3. Switch ALB target group from blue â†’ green (instant switchover, zero overlap)
+4. If green is healthy: delete blue
+ArgoCD doesn't natively support blue-green â€” need Argo Rollouts (a separate project). FleetOps uses rolling deploy (simpler, adequate for this use case).
+
+**Q142: What is the `@CacheEvict` annotation and when does it fire in FleetOps?**
+```java
+@CacheEvict(value = "vehicles", allEntries = true)
+public Vehicle createVehicle(CreateVehicleRequest request) { ... }
+```
+When `createVehicle()` returns (after the vehicle is persisted to DB), Spring's caching proxy evicts ALL entries in the "vehicles" cache from Redis. This ensures the fleet list cache is invalidated whenever a vehicle is added/updated/deleted â€” next GET reads fresh data from DB.
+Cache eviction is synchronous with the method â€” the vehicle is in the DB AND the cache is cleared before the HTTP response is returned to the client.
+
+**Q143: What is the `@Transactional` annotation and is it used in FleetOps?**
+`@Transactional` wraps a method in a database transaction. If the method throws an exception, the transaction is rolled back (all DB changes undone).
+In FleetOps request-service: `createRequest()` does two things:
+1. INSERT into request_db
+2. Call StepFunctions.startExecution()
+If Step Functions call fails, the INSERT should be rolled back. With `@Transactional`: if an unchecked exception escapes, the INSERT is rolled back. Without it: INSERT is permanent even if Step Functions fails.
+Problem: AWS SDK calls inside @Transactional are not part of the DB transaction â€” Step Functions is a separate system. Solution: use the Saga pattern (compensating transactions) or event-driven approach.
+
+**Q144: What is Spring Boot's `spring.jpa.hibernate.ddl-auto` and why is it set to `validate`?**
+`ddl-auto` controls what Hibernate does with the database schema on startup:
+- `create`: drops and recreates schema every start (destroys data â€” NEVER in production)
+- `update`: tries to ALTER schema to match entities (dangerous â€” can lose data)
+- `validate`: checks that DB schema matches entity mappings, throws error if mismatch (CORRECT for production with Flyway)
+- `none`: Hibernate doesn't touch schema
+
+FleetOps uses `validate`. Flyway manages schema creation/migration. Hibernate validates that what Flyway created matches the JPA entity definitions. If they mismatch â†’ startup fails (caught early, before users see errors).
+
+**Q145: How does CORS work in FleetOps and where is it configured?**
+CORS (Cross-Origin Resource Sharing) allows the React frontend (served from `https://fleetops.website`) to call the backend API (also `https://fleetops.website` â€” same origin, no CORS issue!).
+But during local development: frontend runs on `http://localhost:3000`, backend on `http://localhost:8080` â€” different origins â†’ CORS required.
+Spring Boot CORS config:
+```java
+@Configuration
+public class CorsConfig {
+    @Value("${cors.allowed-origins}")  // from ConfigMap: CORS_ALLOWED_ORIGINS
+    private String allowedOrigins;
+    
+    @Bean
+    public WebMvcConfigurer corsConfigurer() {
+        return new WebMvcConfigurer() {
+            @Override
+            public void addCorsMappings(CorsRegistry registry) {
+                registry.addMapping("/api/**")
+                    .allowedOrigins(allowedOrigins.split(","))
+                    .allowedMethods("GET", "POST", "PUT", "DELETE")
+                    .allowedHeaders("Authorization", "Content-Type");
+            }
+        };
+    }
+}
+```
+`CORS_ALLOWED_ORIGINS` is injected from the `fleetops-config` ConfigMap, set by Terraform via SSM to `https://fleetops.website`.
+
+**Q146: What is Helm's `{{ .Release.Name }}` and how are resource names generated?**
+Every resource in a Helm chart uses the release name to avoid naming conflicts:
+```yaml
+metadata:
+  name: {{ .Release.Name }}-auth-service
+  # When ArgoCD deploys with release name "fleetops-auth-prod":
+  # â†’ fleetops-auth-prod-auth-service
+```
+The ArgoCD Application's `releaseName` field sets this. If not set, defaults to the application name. This allows multiple instances of the same chart in different namespaces (e.g., dev and prod) without name collisions.
+
+**Q147: What is the difference between ArgoCD's `Synced` and `Healthy` status?**
+`Synced`: the live cluster state matches what's in Git (ArgoCD applied it successfully).
+`Healthy`: the resources are functioning correctly (Deployment has desired replicas Ready, Ingress has ALB assigned, etc.).
+These are independent:
+- `Synced + Healthy`: deployment succeeded âœ“
+- `OutOfSync + Healthy`: cluster was manually changed (selfHeal will fix it)
+- `Synced + Degraded`: deployment applied but pods not starting (check pod logs)
+- `OutOfSync + Degraded`: deployment pending AND pods failing (worst case)
+
+**Q148: What is the `sync-wave` annotation and who processes it?**
+`argocd.argoproj.io/sync-wave: "3"` is processed by ArgoCD's Application controller. It's not a standard Kubernetes annotation â€” ArgoCD reads it from the Application resource before syncing. Resources with lower wave numbers are applied first and must reach Healthy status before higher wave resources are applied.
+The annotation is on the ArgoCD Application resources (`argocd/apps/prod/*.yaml`), not on the K8s resources themselves.
+
+**Q149: What happens if a Helm chart template has a rendering error?**
+ArgoCD runs `helm template` internally. If template rendering fails (e.g., accessing a nil value in a template), ArgoCD reports the Application as `SyncError` with the template error. No resources are applied. The error is visible in the ArgoCD UI and CLI.
+Example error: `error calling include: template: chart/templates/deployment.yaml:42:22: executing "chart/templates/deployment.yaml" at <.Values.image.tag>: nil pointer evaluating interface {}.tag`
+Fix: ensure `values-prod.yaml` has the required key.
+
+**Q150: How does the maintenance-service EFS mount survive a pod restart?**
+PersistentVolume and PersistentVolumeClaim are cluster resources (not pod resources). When the pod is deleted and recreated:
+1. New pod spec references the same PVC by name
+2. Kubernetes binds the same PVC to the new pod
+3. kubelet mounts the same EFS volume at the same path
+4. Files written by the old pod are still there
+
+EFS is an NFS filesystem â€” data persists independently of pods. The NFS mount is re-established on each pod start. Existing files are immediately accessible.
+
+**Q151: What is `fleetops.website` vs `www.fleetops.website`?**
+The hosted zone is `fleetops.website` (apex/root domain). Route53 has an A record (Alias) at the apex â†’ CloudFront. There is no `www.` record configured. Users must access `https://fleetops.website` directly.
+Production improvement: add `www.fleetops.website` CNAME â†’ `fleetops.website`, or CloudFront alternate domain names include `www.fleetops.website` with a redirect to the apex.
+
+**Q152: How would you add database encryption in transit to FleetOps?**
+RDS PostgreSQL supports SSL. JDBC URL change:
+```properties
+spring.datasource.url=jdbc:postgresql://${POSTGRES_HOST}:5432/auth_db?ssl=true&sslmode=require
+```
+This forces TLS on the JDBC connection. RDS provides a CA certificate bundle â€” the JVM truststore must include it (or `sslmode=verify-full` for certificate validation).
+Currently: traffic between EKS pods and RDS is within the VPC (private subnet) but not encrypted in transit. Security group restriction provides network-level isolation, but not encryption. Adding TLS in transit is a security improvement.
+
+**Q153: What is the Step Functions `Express Workflow` vs `Standard Workflow`?**
+Standard: exactly-once execution, up to 1-year duration, execution history stored for 90 days. Used for: long-running workflows (approval processes, business transactions). Cost: $0.025/1,000 state transitions.
+Express: at-least-once execution (idempotency required), max 5-minute duration, high throughput (100K/s). Used for: IoT event processing, streaming data. Cost: much cheaper per invocation.
+FleetOps uses Standard: service request workflows may take days (waiting for manager approval). Exactly-once is critical â€” don't start two executions for one request.
+
+**Q154: How does `kubectl rollout status` work and how is it used in CI?**
+`kubectl rollout status deployment/fleetops-auth-service --timeout=120s`:
+- Watches the Deployment's rollout progress
+- Exits 0 when: all pods are updated AND ready (readiness probe passing)
+- Exits 1 if timeout exceeded
+Used in CI/CD post-deploy verification:
+```bash
+kubectl rollout status deployment/fleetops-auth-service -n fleetops-prod --timeout=180s
+```
+If the new pods fail to become Ready within 180s (DB down, image pull failure, startup probe timeout), this command fails and the CD workflow fails, alerting the team.
+
+**Q155: What is the `@Api` annotation in Spring Boot and does FleetOps document its APIs?**
+`@Api`, `@ApiOperation`, `@ApiResponse` are Springfox/Swagger annotations for auto-generating OpenAPI documentation. When present, Spring Boot serves an OpenAPI spec at `/v3/api-docs` and Swagger UI at `/swagger-ui.html`.
+FleetOps: API documentation is a known gap (not in the current implementation). Production recommendation: add `springdoc-openapi-starter-webmvc-ui` dependency, annotate controllers, expose swagger UI (protected behind ADMIN role or removed in prod for security).
+
+**Q156: What is the purpose of `kubectl describe` vs `kubectl get`?**
+`kubectl get pod auth-service-abc123`: shows status summary (phase, ready, restarts, age).
+`kubectl describe pod auth-service-abc123`: shows everything â€” events (why pod is stuck), env vars, volumes, probe configurations, resource requests/limits, node assignment, QoS class.
+For debugging: always start with `kubectl describe` to see events (e.g., "Back-off pulling image: 404 Not Found" â†’ wrong image tag, ECR lifecycle policy deleted it).
+
+**Q157: What is `kubectl exec` and when would you use it?**
+`kubectl exec -it auth-service-abc123 -- /bin/sh`: opens a shell inside the running container.
+Debug use cases:
+- `nc -z postgres-host 5432`: verify DB connectivity from inside the pod
+- `env | grep AWS`: verify IRSA env vars are set
+- `cat /var/run/secrets/eks.amazonaws.com/serviceaccount/token`: verify projected OIDC token exists
+- `df -h /var/www/fleetops/shared-media`: verify EFS is mounted and has space
+Note: JRE-only images may not have `/bin/sh` (Alpine has it). Distroless images have no shell â€” use `kubectl debug` instead.
+
+**Q158: What is the EKS `aws-auth` ConfigMap and what happens if it's misconfigured?**
+`aws-auth` in `kube-system` maps IAM entities to Kubernetes RBAC users:
+```yaml
+mapUsers:
+- userarn: arn:aws:iam::538661800892:user/johan
+  username: cluster-admin
+  groups: [system:masters]
+mapRoles:
+- rolearn: arn:aws:iam::538661800892:role/fleetops-prod-github-actions-role
+  username: github-actions
+  groups: [system:masters]
+```
+Misconfiguration risk: if this ConfigMap is deleted or corrupted, ALL kubectl access is lost (even the cluster creator). Recovery: use the EKS API directly (AWS console) or `aws eks update-kubeconfig` with the node role (as a workaround). Production: enable EKS Access Entries (new EKS feature) instead of `aws-auth` for safer management.
+
+**Q159: How does Helm handle secrets in values files?**
+Helm values files are plaintext YAML â€” never store secrets in them. The `values-prod.yaml` in FleetOps contains NO secrets: image tags, replica counts, resource limits, config values. All secrets come from K8s Secrets (ESO-synced from Secrets Manager).
+Pattern used: chart templates reference secrets by name:
+```yaml
+env:
+  - name: POSTGRES_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: fleetops-postgres-secret  # ESO creates this
+        key: POSTGRES_PASSWORD
+```
+The Helm chart never touches the secret value â€” only its reference.
+
+**Q160: What is `kubectl top` and what does it require?**
+`kubectl top pods -n fleetops-prod`: shows real-time CPU and memory usage per pod.
+`kubectl top nodes`: shows per-node usage.
+Requires: metrics-server running in kube-system. FleetOps installs metrics-server (Helm chart 3.12.1) via Terraform. Also used by: HPA (to get CPU metrics for scaling decisions).
+Output:
+```
+NAME                                    CPU(cores)   MEMORY(bytes)
+fleetops-auth-service-7d8b9c-abc12      45m          256Mi
+fleetops-vehicle-service-6f9d-def34     120m         384Mi
+```
+
+**Q161: What is the Kubernetes `Terminating` namespace issue and how is it fixed?**
+If a namespace is stuck in `Terminating` state, it means a resource with a finalizer is preventing deletion. Common cause: ArgoCD Application resources have a finalizer that waits for the app to be deleted cleanly. If ArgoCD is already gone, nothing removes the finalizer.
+Fix: manually remove the finalizer:
+```bash
+kubectl get namespace fleetops-prod -o json | \
+  jq '.spec.finalizers = []' | \
+  kubectl replace --raw "/api/v1/namespaces/fleetops-prod/finalize" -f -
+```
+This force-removes the namespace regardless of finalizers. Use only when confident about what's being deleted.
+
+**Q162: What is Kustomize and how does it compare to Helm?**
+Kustomize: patch-based YAML customization. Uses base + overlays (patch files, prefix/suffix generators, secret generators). Part of kubectl since 1.14.
+Helm: template-based. Go templates + values files. Package manager with versioning, rollback, hooks.
+FleetOps uses Helm: better for parameterized multi-environment deployments (values-dev.yaml, values-prod.yaml). Kustomize would work but requires explicit patch files for every environment difference.
+
+**Q163: What monitoring would you set up to know FleetOps is healthy before an evaluation?**
+```bash
+# 1. All pods Running and Ready
+kubectl get pods -n fleetops-prod
+# 2. ArgoCD all apps Synced and Healthy  
+kubectl get applications -n argocd
+# 3. ALB health checks passing (check target groups in AWS console)
+# 4. Smoke test all endpoints
+curl -s https://fleetops.website/api/auth/health  # or /actuator/health
+curl -s -H "Authorization: Bearer $TOKEN" https://fleetops.website/api/vehicles
+# 5. CloudWatch: no active alarms
+aws cloudwatch describe-alarms --state-value ALARM
+# 6. ESO secrets synced
+kubectl get externalsecrets -n fleetops-prod
+# 7. ArgoCD UI: all green
+open https://argocd.fleetops.website
+```
+
+**Q164: How would you debug a 500 Internal Server Error from a specific endpoint?**
+```
+1. kubectl logs -n fleetops-prod -l app.kubernetes.io/name=fleetops-vehicle-service --tail=100
+   â†’ Find the stack trace
+
+2. kubectl describe pod {failing-pod}
+   â†’ Check for OOMKilled, resource pressure, recent events
+
+3. Check CloudWatch Log Insights:
+   fields @timestamp, @message | filter kubernetes.pod_name = "{pod}" | filter @message like "ERROR"
+
+4. Check HikariCP pool:
+   kubectl logs ... | grep "HikariPool\|connection\|timeout"
+   
+5. Check IRSA creds:
+   kubectl exec -it {pod} -- env | grep AWS_
+   
+6. Check Bedrock/S3/SFN call:
+   Look for AWS SDK exception in the stack trace
+   Common: ThrottlingException, ResourceNotFoundException, AccessDeniedException
+```
+
+**Q165: What is the `spring.datasource.hikari.maximum-pool-size` setting and what value does FleetOps use?**
+HikariCP maximum pool size limits the number of concurrent connections this pod can hold to RDS.
+db.t3.micro max connections â‰ˆ 85. With 4 services Ã— 2 replicas = 8 pods.
+Safe allocation: (85 - 10 for maintenance) / 8 = ~9 per pod. FleetOps sets ~5-7 to be conservative.
+```yaml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 30000  # 30s before giving up
+      idle-timeout: 600000       # 10min idle before closing
+```
+On HPA scale to 5 replicas: 4 services Ã— 5 replicas Ã— 5 connections = 100 > 85. Connection exhaustion. Mitigation: reduce pool size to 3 when deploying at max scale, or use RDS Proxy.
+
