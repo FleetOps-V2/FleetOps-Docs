@@ -545,12 +545,13 @@ PENDING → [MANAGER_REVIEW] → APPROVED → [TECHNICIAN_ASSIGNED] → IN_PROGR
 **WHY Bedrock over OpenAI API:** All data stays within the AWS account. No data sent to third parties. IAM-controlled access. Pay-per-token pricing with no subscription.
 
 **HOW vehicle-service calls Bedrock:**
-1. User calls `POST /api/vehicles/{id}/ai-analysis`
-2. vehicle-service fetches vehicle data from PostgreSQL
-3. Builds a prompt: "Given this vehicle's maintenance history and current status: {data}, provide maintenance recommendations..."
-4. Calls Bedrock `InvokeModel` (or `Converse` API) with model ID `amazon.nova-lite-v1:0`
-5. Bedrock returns generated text
-6. vehicle-service returns the AI analysis to the frontend
+1. Manager/Admin calls `GET /api/vehicles/ai/fleet-analysis`
+2. `analyseFleet()` delegates to `self.invokeBedrockCached()` via Spring AOP proxy (for `@Cacheable` to work)
+3. On cache miss: reads all vehicles from RDS, filters ACTIVE vehicles that are service-due or insurance-expiring (up to 8)
+4. Builds a fleet-wide prompt with per-vehicle mileage, service date, and insurance expiry details
+5. Calls Bedrock **Converse API** (`bedrockClient.converse()`) with model ID `amazon.nova-lite-v1:0`
+6. Parses JSON response into `FleetAnalysisResponse` (fleetHealthScore, summary, recommendations)
+7. Result cached in Redis for 15 minutes; audit record always written to `ai_analysis_audit` table
 
 **Converse API structure:**
 ```json
@@ -560,15 +561,14 @@ PENDING → [MANAGER_REVIEW] → APPROVED → [TECHNICIAN_ASSIGNED] → IN_PROGR
     { "role": "user", "content": [{ "text": "..." }] }
   ],
   "inferenceConfig": {
-    "maxTokens": 1024,
-    "temperature": 0.7
+    "maxTokens": 2500
   }
 }
 ```
 
-**Authentication:** Bedrock credentials stored as a Kubernetes Secret `fleetops-bedrock-secret` (created directly by Terraform, not via External Secrets Operator, because Bedrock keys are IAM user keys — not in Secrets Manager). Alternatively, IRSA on `fleetops-app` role has `bedrock:InvokeModel` permission — the cleaner approach.
+**Authentication:** `BedrockRuntimeClient` uses `StsAssumeRoleCredentialsProvider` (if `bedrock.role-arn` is configured) or `DefaultCredentialsProvider` (resolves to IRSA inside the pod). No static credentials at runtime.
 
-**Redis caching of AI responses:** AI calls are expensive (~50–200ms, charged per token). vehicle-service caches Bedrock responses in Redis with a longer TTL (analysis for the same vehicle doesn't change in 5 minutes).
+**Redis caching of AI responses:** `@Cacheable(value="fleetAnalysis", key="'current'")` — fleet-wide cache, 15-minute TTL (configured per-cache in `CacheConfig`). Falls back to `NoOpCacheManager` if Redis is unavailable. The outer `analyseFleet()` method always records an audit entry even on cache hits.
 
 ---
 
@@ -1495,35 +1495,37 @@ A: Flow: 1) Terraform creates the secret in Secrets Manager at `fleetops/prod/la
 POST https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.nova-lite-v1:0/converse
 
 Request body:
+```json
 {
+  "modelId": "amazon.nova-lite-v1:0",
   "messages": [
     {
       "role": "user",
-      "content": [{"text": "Vehicle ID: V-001, Make: Toyota, Model: Land Cruiser, Year: 2020, Last service: 6 months ago, Mileage: 45000km, Status: ACTIVE. Provide maintenance recommendations."}]
+      "content": [{"text": "You are a fleet maintenance advisor...\nFleet overview: 12 total vehicles, 3 needing service, 2 with insurance expiring within 30 days...\n- KA01AB1234 (id=5): current=48200 km, OVERDUE by 3200 km, service due in -12 days, insurance expires in 18 days"}]
     }
   ],
   "inferenceConfig": {
-    "maxTokens": 1024,
-    "temperature": 0.7,
-    "topP": 0.9
+    "maxTokens": 2500
   }
 }
+```
 
 Response:
+```json
 {
   "output": {
     "message": {
       "role": "assistant",
-      "content": [{"text": "Based on the vehicle data provided, here are maintenance recommendations..."}]
+      "content": [{"text": "{\"fleetHealthScore\":71,\"summary\":\"...\",\"recommendations\":[...]}"}]
     }
   },
-  "usage": {"inputTokens": 85, "outputTokens": 342}
+  "usage": {"inputTokens": 512, "outputTokens": 480}
 }
 ```
 
-**Authentication:** IRSA. The `fleetops-app` IRSA role has `bedrock:InvokeModel` on `arn:aws:bedrock:us-east-1::foundation-model/*`. The SDK uses the projected OIDC token to get STS temporary credentials and signs the Bedrock API request with SigV4.
+**Authentication:** `BedrockRuntimeClient` uses `StsAssumeRoleCredentialsProvider` (assumes `bedrock.role-arn` via STS) or `DefaultCredentialsProvider` (IRSA). The SDK signs every request with SigV4 using the resolved temporary credentials. No static credentials.
 
-**Caching strategy:** Redis key `ai-analysis:{vehicleId}` with 5-minute TTL. This reduces Bedrock cost (charged per token) and latency for repeated dashboard loads.
+**Caching strategy:** `@Cacheable(value="fleetAnalysis", key="'current'")` backed by `RedisCacheManager` with a 15-minute TTL for the `fleetAnalysis` cache. One fleet-wide result served to all users for 15 minutes. Cache key is `"current"` — not per-vehicle. Falls back to `NoOpCacheManager` if Redis is unavailable at pod startup.
 
 **Cost:** Nova Lite costs approximately $0.00006 per 1K input tokens and $0.00024 per 1K output tokens — very low for this use case (~$0.01 per 100 analyses).
 
