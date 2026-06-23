@@ -5740,3 +5740,638 @@ spring:
 ```
 On HPA scale to 5 replicas: 4 services Ã— 5 replicas Ã— 5 connections = 100 > 85. Connection exhaustion. Mitigation: reduce pool size to 3 when deploying at max scale, or use RDS Proxy.
 
+
+
+---
+
+## PHASE 10 â€” Q&A CONTINUED (Q166â€“Q260)
+
+### GENERAL ARCHITECTURE â€” continued
+
+**Q166. Why does FleetOps use four separate microservices instead of a monolith?**
+Each service owns a distinct bounded context: identity/audit (auth), asset registry (vehicle), work orders (maintenance), and service requests (request). Independent deployability means a bug in maintenance-service doesn't require redeploying auth-service. Each service scales independently â€” vehicle-service handles heavy GPS polling while request-service is low-traffic. Different data schemas are isolated: no cross-service foreign keys; communication is via REST or event (SNS/EventBridge).
+
+**Q167. How does a React SPA handle page refresh without returning 404?**
+Nginx is configured with `try_files $uri $uri/ /index.html` â€” any path that doesn't match a static file falls through to index.html. React Router then interprets the URL client-side. Without this, a refresh on `/vehicles/42` hits Nginx, which looks for a file at that path, finds nothing, and returns 404.
+
+**Q168. Why is the frontend served through CloudFront rather than directly from the ALB?**
+CloudFront provides: global edge caching (static assets served from PoP nearest to user), TLS termination at the edge, WAF integration, custom cache behaviors (long TTL for `/assets/*`, no-cache for `/index.html`), and DDoS protection via AWS Shield Standard. The ALB only handles origin requests for API paths.
+
+**Q169. Explain the dual-host ingress design (fleetops.website vs origin.fleetops.website).**
+CloudFront rewrites `Host: fleetops.website` to `Host: origin.fleetops.website` when forwarding to the ALB origin. The ALB Ingress Controller creates one listener with two host-based routing rules. Lambda functions (non-VPC) also call `origin.fleetops.website` directly to bypass CloudFront and reach backend pods. Without this second host rule, CloudFrontâ†’ALB routing would return 404.
+
+**Q170. What happens when HikariCP exhausts its connection pool?**
+HikariCP waits up to `connectionTimeout` (30s default) for a connection to become available. If no connection is freed in that window, it throws `SQLTransientConnectionException`. Under sustained load this surfaces as HTTP 500s. Mitigation: increase pool size, add read replicas, implement circuit breakers, or reduce query latency to return connections faster.
+
+**Q171. How does Flyway know which migrations have already run?**
+Flyway maintains a `flyway_schema_history` table in the target database. Each applied migration is recorded with its version, description, checksum, and execution timestamp. On startup, Flyway compares pending migration files against this table and only applies unapplied scripts in version order. If a previously-applied script's checksum changes, Flyway fails with a validation error.
+
+**Q172. Why does the auth-service use HS256 for JWT signing instead of RS256?**
+HS256 uses a shared symmetric key â€” simpler for a single-issuer/single-verifier pattern where only auth-service signs and only auth-service verifies. RS256 would add value if other services needed to verify tokens independently without sharing the secret. In FleetOps, downstream services pass tokens to auth-service's `/api/auth/validate` endpoint for verification, so a shared secret is sufficient and simpler.
+
+**Q173. What is the purpose of the audit trail in auth-service?**
+Every login, logout, failed attempt, role change, and token validation is written to an audit log table. This satisfies compliance requirements (who accessed what, when), enables forensic investigation after a security incident, and feeds CloudWatch metrics for anomaly detection. Exposed at `/api/audit` â€” only accessible to ADMIN role.
+
+**Q174. How does Redis serve as both a cache and a session store in FleetOps?**
+For caching: frequently-read vehicle status data is stored with a TTL so RDS isn't hammered by GPS polling. For session: JWT blacklist entries (on logout) are stored in Redis with TTL matching the token's remaining expiry. When auth-service validates a token, it checks Redis for a blacklist entry before trusting the JWT signature â€” this enables stateless JWT with revocation capability.
+
+**Q175. What is the data flow when a maintenance request is created?**
+Client POST `/api/requests` â†’ ALB â†’ request-service pod â†’ validates JWT via auth-service â†’ writes ServiceRequest to its RDS schema â†’ publishes `ServiceRequested` event to SNS â†’ EventBridge rule matches event â†’ triggers alert-processor Lambda â†’ Lambda calls back to vehicle-service and auth-service to enrich event â†’ publishes to insurance SNS or service SNS â†’ Step Functions workflow starts for multi-step approval if needed.
+
+**Q176. How does the S3 presigned URL mechanism work for media uploads?**
+Client requests upload URL from maintenance-service â†’ service calls `s3:PutObject` presigned URL generation (SigV4-signed, 15-min expiry, scoped to specific key) â†’ returns URL to client â†’ client uploads directly to S3 (no traffic through backend) â†’ S3 stores object â†’ service stores the S3 key reference in RDS. This avoids streaming large files through application pods.
+
+**Q177. What monitoring signals would indicate the system is unhealthy?**
+Key signals: ALB 5xx rate >1% (SLO breach), P99 latency >2s, HikariCP active connections near pool max, RDS CPU >70%, Redis memory >80%, EKS node CPU/memory >80%, pod restart count >3 in 5 minutes, Flyway migration failure on startup, ESO sync failures (secrets not refreshed), ArgoCD sync health degraded.
+
+**Q178. How does the application handle a Redis failure gracefully?**
+Spring Boot services with `spring.cache.type=redis` should be configured with `cache-null-values=true` and a fallback to read-through from RDS when Redis is unavailable. If Redis is completely down, the circuit breaker (if implemented) opens and all cache reads fall through to the database. This increases RDS load significantly â€” hence the importance of Redis cluster mode for HA.
+
+**Q179. What is the role of EventBridge in the architecture versus SNS?**
+SNS is a push-based fan-out to subscribers (email, Lambda, SQS). EventBridge is a rules-based event bus with schema registry, content-based filtering, and cross-account routing. In FleetOps: SNS delivers alerts to end users (email subscriptions). EventBridge filters specific event patterns (e.g., `ServiceRequested` with `priority=HIGH`) and routes to Lambda â€” decoupling event producers from consumers without point-to-point Lambda invocations.
+
+**Q180. Explain the Step Functions Standard Workflow for service request approval.**
+Standard Workflow: durable execution state persisted externally, exactly-once execution, supports waits up to 1 year. States: (1) ValidateRequest â€” Lambda validates fields, (2) CheckVehicleAvailability â€” Lambda calls vehicle-service, (3) Choice â€” if available, go to AssignTechnician; if not, go to QueueRequest, (4) AssignTechnician â€” Lambda calls maintenance-service, (5) NotifyParties â€” Lambda publishes SNS, (6) End. Each state transition is logged to CloudWatch.
+
+**Q181. Why use Bedrock's Nova Lite model specifically?**
+amazon.nova-lite-v1:0 is AWS's lowest-latency, lowest-cost multimodal model in Bedrock â€” appropriate for real-time fleet analysis queries where response speed matters more than maximum reasoning depth. It supports text and image inputs, enabling future maintenance-image analysis. Bedrock eliminates the need to manage model infrastructure and provides VPC endpoint support for private access.
+
+**Q182. How does CloudFront cache invalidation work when the frontend is redeployed?**
+The CI/CD pipeline hashes asset filenames (Vite content-hash: `main.abc123.js`). Since filenames change with each build, CloudFront automatically serves new assets â€” no invalidation needed for `/assets/*`. Only `/index.html` needs explicit invalidation (`aws cloudfront create-invalidation --paths /index.html`) because it has a short TTL and is the entry point that references the new hashed assets.
+
+**Q183. What is the VPC architecture and why are services in private subnets?**
+Three subnet tiers: public (ALB, NAT Gateway), private (EKS nodes, pods via VPC CNI), database (RDS, ElastiCache â€” no internet route). EKS nodes are in private subnets â€” they reach the internet via NAT Gateway (for ECR pulls, AWS API calls) but are not directly reachable from the internet. RDS and Redis are in database subnets with SG rules allowing only traffic from the EKS cluster SG.
+
+**Q184. How does the ALB perform health checks on pods?**
+ALB is configured with `healthcheck-path: /actuator/health` and `healthcheck-interval-seconds: 30`. For each registered pod IP (target-type: ip), the ALB sends GET requests to port 8080 (or 80 for frontend) at /actuator/health. Two consecutive successes (healthy-threshold: 2) mark a target healthy; three consecutive failures (unhealthy-threshold: 3) remove it from rotation. Spring Actuator returns 200 with `{"status":"UP"}` when all health indicators pass.
+
+**Q185. What happens to in-flight requests during a rolling deployment?**
+With `maxUnavailable: 0`, old pods stay in service until new pods pass readiness probes. The ALB drains connections from terminating pods (deregistration delay: 30s default) â€” existing requests complete before the pod dies. New requests go to new pods. `preStop` hook adds a sleep to give the ALB time to deregister before the container process exits. Zero downtime is achievable but requires correct probe and deregistration configuration.
+
+**Q186. How are database credentials rotated without application downtime?**
+Secrets Manager supports automatic rotation via Lambda. When rotation fires: (1) Lambda creates new DB credentials in RDS, (2) stores them in Secrets Manager, (3) ESO detects changed secret version within its reconcile interval (1h default or triggered), (4) updates the K8s Secret, (5) pods read the updated secret from the mounted volume (file-based secrets are live-updated by kubelet without pod restart). HikariCP re-authenticates new connections with the updated credentials.
+
+**Q187. What observability stack is used and what does each component provide?**
+CloudWatch: metrics (EKS, RDS, Lambda, ALB), log groups (Fluent Bit â†’ CloudWatch Logs), alarms, dashboards. X-Ray: distributed tracing â€” traces span from ALB through Spring Boot services (via AWS X-Ray SDK) to RDS/Redis calls, showing P50/P99 latency per segment. CloudTrail: API audit log for all AWS control-plane calls. AWS Config: compliance drift detection (e.g., security group opens port 22 to 0.0.0.0/0 â€” triggers non-compliant finding).
+
+**Q188. Why use KMS customer-managed keys (CMK) instead of AWS-managed keys?**
+CMK provides: key rotation control (annual), key usage audit via CloudTrail (`kms:Decrypt` events show exactly which principal decrypted what), key policy enforcement (deny Decrypt to specific principals), and cross-account sharing. AWS-managed keys (`aws/rds`, `aws/s3`) cannot be deleted, have no custom key policy, and AWS controls rotation. For compliance (GDPR data erasure via key deletion, audit requirements), CMK is essential.
+
+**Q189. Explain how WAF protects the application.**
+WAFv2 WebACL is associated with the CloudFront distribution. Rule groups: AWS Managed Rules (common attack patterns â€” SQLi, XSS, known bad IPs), rate-based rule (limit to 2000 requests/5min per IP to prevent brute force), size constraint (reject bodies >10MB to prevent large payload attacks). WAF evaluates rules top-down; first match wins. Blocked requests get 403. WAF logs to S3 for forensic analysis.
+
+**Q190. How does ACM certificate auto-renewal work?**
+ACM monitors certificate expiry. For DNS-validated certificates (used in FleetOps), ACM automatically renews ~60 days before expiry by re-verifying the CNAME record in Route53. Since the CNAME was added during initial validation and never removed, renewal is fully automatic â€” no manual action needed. The new certificate is automatically deployed to CloudFront and ALB.
+
+---
+
+### AWS DEEP DIVE â€” continued
+
+**Q191. What is the EKS control plane and who manages it?**
+AWS manages the control plane: API server, etcd, scheduler, controller manager â€” all run in AWS-managed VPC, multi-AZ, with automated patching and HA. You pay $0.10/hour per cluster. You manage: node groups, add-ons (VPC CNI, CoreDNS, kube-proxy, EBS CSI), and Kubernetes objects. The cluster endpoint is exposed publicly (restricted to `eks_public_access_cidrs` in FleetOps) or privately.
+
+**Q192. How does EKS authenticate kubectl commands?**
+`aws eks get-token --cluster-name fleetops-prod` generates a presigned STS `GetCallerIdentity` URL, base64-encoded as a Bearer token. The EKS API server's webhook authenticator (`aws-iam-authenticator`) calls STS to resolve the IAM identity from the token. It then maps the IAM ARN to a Kubernetes RBAC username via the `aws-auth` ConfigMap. The RBAC binding determines what the identity can do.
+
+**Q193. What is the aws-auth ConfigMap and how does it work?**
+`aws-auth` in `kube-system` maps IAM roles/users to K8s RBAC users/groups. Example entry: `rolearn: arn:aws:iam::ACCOUNT:role/eks-node-role, username: system:node:{{EC2PrivateDNSName}}, groups: [system:bootstrappers, system:nodes]`. Node group role is mapped here so kubelets can authenticate. Admin IAM users are mapped to `system:masters` group. Misconfiguration locks out all cluster access.
+
+**Q194. Explain EKS managed node groups versus self-managed nodes.**
+Managed node groups: AWS provisions and manages EC2 instances, auto-scaling group, AMI updates, graceful node draining during updates â€” all via EKS API. Self-managed: you provision EC2s, configure kubelet, manage AMI, handle drain/cordon manually. FleetOps uses managed node groups (`module.eks_nodegroup`) â€” simpler lifecycle management, automatic security patches, EKS-optimized AMI (Amazon Linux 2 with containerd).
+
+**Q195. How does the EBS CSI driver work in EKS?**
+EBS CSI driver runs as a DaemonSet (node plugin) + Deployment (controller). When a PVC with `storageClass: gp3` is created, the controller calls EC2 `CreateVolume` API (using IRSA credentials), then `AttachVolume` to the node hosting the pod. The node plugin then formats and mounts the volume at the pod's requested path. On pod delete/move, the driver calls `DetachVolume` and optionally `DeleteVolume` (if reclaim policy is Delete).
+
+**Q196. What is the difference between EFS and EBS in the FleetOps context?**
+EFS: NFS-based, multi-AZ, multiple pods can mount simultaneously (ReadWriteMany) â€” used for maintenance-service shared media storage. EBS: block storage, single-AZ, one node at a time (ReadWriteOnce) â€” appropriate for databases but not used in FleetOps pods directly. EFS costs more per GB (~$0.30/GB vs ~$0.08/GB for EBS gp3) but provides the shared access pattern needed for media files across multiple pod replicas.
+
+**Q197. How does RDS Multi-AZ work and what does it protect against?**
+RDS Multi-AZ synchronously replicates all writes from the primary instance to a standby in another AZ using Amazon's internal replication protocol (not PostgreSQL streaming replication). The standby is not readable. On primary failure (hardware, AZ outage, maintenance), RDS automatically updates the CNAME DNS record to point to the standby â€” typically within 60-120 seconds. Applications reconnect after TCP timeout; HikariCP reconnects automatically.
+
+**Q198. What is ElastiCache Redis cluster mode and why isn't it enabled in FleetOps?**
+Cluster mode partitions data across multiple primary shards (up to 500), each with up to 5 read replicas â€” enables horizontal scaling of both reads and writes. FleetOps uses a single-node Redis (`redis_node_type: cache.t3.micro`) â€” appropriate for a training project. In production, you'd enable cluster mode with at least 3 shards and 1 replica per shard for HA. Without cluster mode, Redis failure means total cache unavailability.
+
+**Q199. How does SNS fanout work with multiple subscribers?**
+When a message is published to an SNS topic, SNS delivers copies to ALL subscriptions concurrently. In FleetOps: `insurance_alerts_topic` has email subscription(s) and optionally a Lambda. SNS retries failed deliveries (with exponential backoff for Lambda, with delivery policy for HTTP). Email subscriptions require opt-in confirmation. SNS is not ordered and has at-least-once delivery â€” idempotent consumers are important.
+
+**Q200. What is the Lambda cold start problem and how is it mitigated?**
+Cold start: when Lambda has no warm execution environment, it must: provision a micro-VM, load the runtime (Node.js 18), download and initialize the function code, run the handler. For Node.js this takes 200-500ms typically. Mitigation options: Provisioned Concurrency (pre-warms N environments â€” costs money), keep functions small (fast init), avoid VPC placement (adds ENI attachment time ~500ms). FleetOps Lambda is non-VPC â€” avoids the ENI penalty.
+
+**Q201. How does Lambda access FleetOps backend services if it's not in the VPC?**
+Lambda calls `origin.fleetops.website` â€” a public DNS name pointing to the ALB. Traffic path: Lambda â†’ internet â†’ Route53 resolves origin.fleetops.website â†’ ALB â†’ pod. The ALB has an internet-facing scheme, so it's reachable from the internet. WAF and ALB security groups control what traffic is allowed. Lambda uses stored credentials (from Secrets Manager via `lambda_service_credentials_secret_arn`) to authenticate as a service account.
+
+**Q202. What is the X-Ray service map and what does it show?**
+X-Ray aggregates trace segments from instrumented services into a service map â€” a directed graph showing: nodes (services/AWS resources), edges (calls between them), latency histograms per edge, error rates per node. In FleetOps: ALB â†’ auth-service â†’ RDS, ALB â†’ vehicle-service â†’ Redis â†’ RDS, Lambda â†’ vehicle-service â†’ RDS. Helps identify which service is the bottleneck (longest segment) or highest error source.
+
+**Q203. How does CloudTrail differ from CloudWatch Logs?**
+CloudTrail: records AWS API calls (control plane) â€” who called what AWS API, when, from where, with what parameters. Stored in S3, queryable via Athena. Example: `ec2:CreateSecurityGroup`, `secretsmanager:GetSecretValue`, `sts:AssumeRoleWithWebIdentity`. CloudWatch Logs: application and infrastructure logs â€” stdout/stderr from containers (via Fluent Bit), Lambda execution logs, VPC flow logs. CloudTrail is for "who did what to AWS infrastructure"; CloudWatch Logs is for "what happened inside the application."
+
+**Q204. What does AWS Config actually check in FleetOps?**
+AWS Config evaluates managed rules against resource configurations. Example rules: `restricted-ssh` (flags SGs allowing port 22 from 0.0.0.0/0), `s3-bucket-public-read-prohibited` (flags public S3 buckets), `encrypted-volumes` (flags unencrypted EBS), `rds-storage-encrypted` (flags unencrypted RDS), `iam-root-access-key-check` (flags root access keys). Non-compliant findings appear in Config console and can trigger SNS notifications.
+
+**Q205. How does ECR image scanning work?**
+ECR supports two scan types: Basic (uses Clair, free) and Enhanced (uses Inspector, additional cost). On push, ECR scans the image layers against a CVE database. Results include findings by severity (CRITICAL, HIGH, MEDIUM, LOW, INFORMATIONAL). In CI/CD, Trivy performs a pre-push scan â€” images with CRITICAL CVEs fail the pipeline. ECR lifecycle policies automatically delete old untagged images (keeping last 10 tagged images) to reduce storage cost and attack surface.
+
+**Q206. What is the purpose of the KMS events_key in FleetOps?**
+`kms.events_key_arn` is used by: SNS topic encryption (messages at rest), Step Functions execution history encryption, CloudTrail log file encryption, CloudWatch Log group encryption, EventBridge archive encryption. Centralizing these under one CMK simplifies key management and audit â€” all `kms:Decrypt` calls for event data appear under one key in CloudTrail.
+
+**Q207. How does Secrets Manager secret rotation Lambda work internally?**
+The rotation Lambda follows a 4-step protocol: (1) `createSecret` â€” generates new credentials, stores as `AWSPENDING` version, (2) `setSecret` â€” applies the new password to the RDS instance via `rds:ModifyDBInstance`, (3) `testSecret` â€” connects with `AWSPENDING` credentials to verify they work, (4) `finishSecret` â€” promotes `AWSPENDING` to `AWSCURRENT`, demotes old version to `AWSPREVIOUS`. ESO then picks up the new `AWSCURRENT` on next reconcile.
+
+**Q208. What is the SSM Parameter Store used for vs Secrets Manager?**
+SSM Parameter Store (Standard tier, free): non-sensitive configuration â€” Redis endpoint, CORS origins, SNS topic ARNs, base URL. These are injected via ESO as K8s ConfigMaps. Secrets Manager (paid, ~$0.40/secret/month): sensitive credentials â€” DB password, JWT secret, GitHub PAT. The distinction: SSM for config that's inconvenient to hardcode; Secrets Manager for data that must be audited, rotated, and encrypted.
+
+**Q209. Explain the Route53 DNS resolution path for fleetops.website.**
+Route53 hosts the `fleetops.website` public hosted zone. `fleetops.website` A record â†’ CloudFront distribution IP (alias record, not a real IP â€” AWS manages the IP pool). `origin.fleetops.website` A record â†’ ALB DNS name (alias). `argocd.fleetops.website` A record â†’ same ALB. When a client resolves `fleetops.website`, Route53 returns CloudFront IPs; CloudFront proxies to `origin.fleetops.website` for dynamic content.
+
+**Q210. How does CloudFront determine which requests go to the ALB vs. serve cached content?**
+CloudFront behaviors (ordered by path pattern, most specific first): `/api/*` â†’ forward to ALB origin (no caching, forward all headers + cookies), `/assets/*` â†’ cache at edge (TTL: 1 year, content-hash filenames), `/index.html` â†’ cache with low TTL (no-store or 5min), `/*` â†’ cache with medium TTL. API requests always hit origin; static assets are served from edge caches worldwide.
+
+---
+
+### KUBERNETES â€” continued
+
+**Q211. What is a Kubernetes Operator and does FleetOps use any?**
+An Operator is a custom controller that encodes operational knowledge about a stateful application. It watches Custom Resources (CRDs) and reconciles actual state to desired state. FleetOps uses: External Secrets Operator (watches `ExternalSecret` CRDs â†’ reconciles K8s Secrets from Secrets Manager), ArgoCD (watches `Application` CRDs â†’ reconciles cluster state from Git). Both are installed via Helm during Terraform `eks_addons` provisioning.
+
+**Q212. How does Horizontal Pod Autoscaler decide when to scale?**
+HPA watches a metric source (typically `cpu` from metrics-server) at `--horizontal-pod-autoscaler-sync-period` (15s default). Desired replicas = ceil(currentReplicas Ã— currentMetric / targetMetric). Example: 2 replicas at 80% CPU, target 50% â†’ ceil(2 Ã— 80/50) = ceil(3.2) = 4 replicas. Scale-up is immediate when threshold is exceeded; scale-down waits `--horizontal-pod-autoscaler-downscale-stabilization` (5min default) to avoid thrashing.
+
+**Q213. What is the metrics-server and how does it feed HPA?**
+metrics-server is a Deployment that scrapes `kubelet/metrics/resource` from each node (via the Summary API) every 15s. It aggregates CPU and memory per pod and exposes them via the `metrics.k8s.io` API. HPA queries this API. metrics-server is NOT a long-term metrics store â€” it holds only the current sample. For historical metrics, Prometheus + Adapter is needed (not in FleetOps scope).
+
+**Q214. Explain pod affinity and anti-affinity â€” why would you use them?**
+Pod affinity: schedule pods near other pods (same node or AZ). Pod anti-affinity: spread pods away from each other. In FleetOps: `topologySpreadConstraints` or anti-affinity rules would ensure 2 replicas of auth-service don't both land on the same node â€” if that node fails, one replica survives. Without anti-affinity, the scheduler may colocate both replicas on the cheapest-fitting node, creating a single point of failure.
+
+**Q215. What is a PodDisruptionBudget and why is it important during node upgrades?**
+PDB specifies the minimum number of pods that must remain available during voluntary disruptions (node drain, rolling update). Example: `minAvailable: 1` for a 2-replica deployment means draining a node that hosts one replica is allowed (1 remains), but draining a node that hosts both is blocked. During EKS managed node group updates (which drain nodes), PDBs prevent all replicas of a service from being evicted simultaneously.
+
+**Q216. How does the Kubernetes scheduler place pods?**
+Scheduling is two phases: (1) Filtering â€” eliminate nodes that don't satisfy hard constraints: resource requests (CPU/memory), nodeSelector, affinity/anti-affinity, taints/tolerations, volume topology. (2) Scoring â€” rank remaining nodes by priority functions: LeastAllocated (prefer nodes with most free resources), spreading scores, image locality (prefer nodes that already have the image). Pod goes to the highest-scoring node.
+
+**Q217. What is a taint and toleration? Give a practical example.**
+Taint: mark a node to repel pods. `kubectl taint nodes node1 dedicated=gpu:NoSchedule` â€” no pod lands on node1 unless it has a matching toleration. Toleration: allow a pod to be scheduled on a tainted node. Use case: reserve GPU nodes for ML workloads. In EKS, nodes tainted `eks.amazonaws.com/nodegroup=monitoring:NoSchedule` would only accept monitoring pods that tolerate the taint.
+
+**Q218. What happens when a pod's OOMKilled limit is hit repeatedly?**
+CrashLoopBackOff: kubelet applies exponential backoff between restarts (10s, 20s, 40s... up to 5min). The pod's `restartCount` increments. `kubectl describe pod` shows `OOMKilled` as the last termination reason and exit code 137. Mitigation: increase memory limit, fix memory leak, or reduce memory-intensive operations. Check JVM heap settings â€” Spring Boot on Java 21 should use `-XX:MaxRAMPercentage=75` to cap heap at 75% of the container limit.
+
+**Q219. What is the difference between a liveness probe and a readiness probe?**
+Liveness: "Is this container alive?" Failure â†’ kubelet kills and restarts the container. Use for detecting deadlocks or hung processes. Readiness: "Is this container ready to serve traffic?" Failure â†’ pod removed from Service endpoints (no traffic sent). Use during startup or when a downstream dependency is unavailable. In FleetOps: `/actuator/health/liveness` and `/actuator/health/readiness` are separate Spring Boot endpoints â€” readiness can fail when RDS is unreachable without killing the pod.
+
+**Q220. How does a Kubernetes Service of type ClusterIP work internally?**
+ClusterIP is a virtual IP (VIP) assigned from the service CIDR (e.g., 10.100.0.0/16). No process actually listens on this IP â€” it exists only in iptables rules managed by kube-proxy. When a pod sends a packet to the ClusterIP:port, iptables intercepts in PREROUTING, traverses KUBE-SERVICES â†’ KUBE-SVC-xxx â†’ KUBE-SEP-xxx (one per endpoint, probabilistic selection) â†’ DNAT rewrites destination to a pod IP:port. The packet then routes normally to the pod.
+
+**Q221. Why doesn't FleetOps use NodePort or LoadBalancer Service types for backend services?**
+NodePort exposes a static port on every node â€” bypasses the ingress layer, harder to secure, not path-based. LoadBalancer creates one AWS ELB per service â€” expensive (one ELB ~$16-18/month Ã— 4 services = $64-72/month extra) and unmanageable at scale. ClusterIP + ALB Ingress Controller provides one shared ALB with path-based routing to all services â€” one ELB, one ACM cert, unified access logs.
+
+**Q222. Explain ConfigMap volume mounts vs. environment variable injection.**
+Volume mount: ConfigMap data is mounted as files in the container filesystem. Kubelet watches the ConfigMap and updates the file without pod restart (within ~1min). Useful for config files (application.yml, nginx.conf). Environment variable: `envFrom: configMapRef`. Injected at pod startup, NOT updated on ConfigMap change â€” requires pod restart. FleetOps uses env vars for most Spring Boot properties; a config change requires a rollout.
+
+**Q223. What is RBAC in Kubernetes? Name the four resource types.**
+RBAC (Role-Based Access Control) controls who can do what to which K8s resources. Four types: (1) Role â€” namespace-scoped set of rules (verbs on resources), (2) ClusterRole â€” cluster-scoped rules, (3) RoleBinding â€” binds a Role to a subject (user, group, ServiceAccount) within a namespace, (4) ClusterRoleBinding â€” binds a ClusterRole cluster-wide. ESO uses a ClusterRole to read ClusterSecretStore and create Secrets in any namespace.
+
+**Q224. How does ArgoCD detect configuration drift?**
+ArgoCD's application controller polls Git every 3 minutes (default) or via Git webhook. It compares the desired state (rendered manifests from Git) against live state (K8s API server). Diff is computed using a three-way merge (like `kubectl apply`). Differences are reported as `OutOfSync`. With `syncPolicy: automated`, ArgoCD applies the diff automatically. Drift can also be detected for resources modified directly with `kubectl` (bypassing Git).
+
+**Q225. What are ArgoCD sync waves and why does FleetOps use them?**
+Sync wave is `argocd.argoproj.io/sync-wave` annotation on resources. ArgoCD applies resources in ascending wave order, waiting for each wave's resources to be healthy before proceeding. FleetOps waves: 0 (namespaces, CRDs), 1 (ClusterSecretStore), 2 (ExternalSecrets), 3 (ConfigMaps), 4 (Deployments), 5 (Ingress). This ensures secrets exist before pods start, and pods exist before ingress routes to them â€” preventing startup race conditions.
+
+**Q226. What is the App-of-Apps pattern in ArgoCD?**
+A root Application points to a directory of Application manifests in Git. Each child Application manages a subset of the cluster (e.g., auth-service, vehicle-service, infrastructure). The root app is bootstrapped manually; it then syncs and creates all child apps, which then sync their own resources. Benefits: single ArgoCD installation manages arbitrary numbers of apps; adding a new service means adding one Application manifest to Git â€” no manual ArgoCD configuration.
+
+**Q227. How does the External Secrets Operator authenticate to AWS Secrets Manager?**
+ESO pod has a ServiceAccount annotated with `eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/fleetops-eso-role`. The Pod Identity Webhook mutates the pod spec to inject the OIDC token at a projected volume path. When ESO calls `secretsmanager:GetSecretValue`, the AWS SDK automatically exchanges the projected token for temporary credentials via `sts:AssumeRoleWithWebIdentity`. The IAM role policy grants `secretsmanager:GetSecretValue` on `fleetops/prod/*` resources only.
+
+**Q228. What happens if an ExternalSecret fails to sync?**
+The ExternalSecret resource's status shows `SecretSyncedError` condition. ESO retries with exponential backoff. The existing K8s Secret is NOT deleted â€” it retains the last successfully synced value. Pod startup that depends on the secret may fail if the Secret doesn't exist yet (first sync). If ESO is down entirely, existing Secrets persist but won't be refreshed â€” stale credentials for up to ~1h before rotation is missed.
+
+**Q229. How does NetworkPolicy enforce pod-to-pod traffic rules?**
+NetworkPolicy is implemented by the CNI plugin (VPC CNI uses eBPF or iptables, or requires a separate policy engine like Calico). A NetworkPolicy selects pods via `podSelector` and specifies allowed ingress/egress. Without a policy, all traffic is allowed. With a deny-all policy plus explicit allows, only permitted paths work. Example: allow ingress to auth-service:8080 only from pods with label `component: frontend` â€” drops all other ingress silently.
+
+**Q230. What is a DaemonSet and what does FleetOps run as a DaemonSet?**
+DaemonSet ensures exactly one pod runs on every node (or a selected subset). In FleetOps: Fluent Bit runs as a DaemonSet â€” it needs to read `/var/log/containers/*.log` from the node filesystem, so one instance per node is required. Other DaemonSets in EKS: `aws-node` (VPC CNI), `kube-proxy`. When a new node joins, the DaemonSet controller automatically schedules the pod on it.
+
+---
+
+### TERRAFORM â€” continued
+
+**Q231. What is the Terraform dependency graph and how is it constructed?**
+Terraform builds a DAG where each resource/module is a node. Edges come from explicit references (`module.rds.db_endpoint` creates edge networkingâ†’rds), `depends_on` annotations, and provider dependencies. During plan/apply, Terraform traverses the DAG in topological order â€” resources with no dependencies are provisioned first (in parallel), dependents follow. `terraform graph | dot -Tpng` renders the visual graph.
+
+**Q232. What happens during `terraform plan` vs `terraform apply`?**
+Plan: reads current state from S3 backend, queries AWS APIs to get actual resource attributes, computes diff (create/update/replace/destroy), outputs the execution plan without making changes. Apply: executes the plan â€” calls AWS APIs to create/modify/delete resources, updates state file on success. The state file is locked (DynamoDB) during apply to prevent concurrent modifications from another operator.
+
+**Q233. What does `terraform refresh` do and when is it useful?**
+`terraform refresh` (or `terraform apply -refresh-only`) queries AWS APIs to update the state file with actual resource attributes, without making changes to infrastructure. Useful when: someone manually modified a resource (drift detection), a resource attribute changed outside Terraform (e.g., security group rule added via console), or after importing existing resources. After refresh, `terraform plan` shows the correct drift.
+
+**Q234. Explain the Terraform lifecycle meta-argument `create_before_destroy`.**
+By default, Terraform destroys the old resource before creating the replacement (for resources that must be replaced). `create_before_destroy = true` reverses this: new resource is created first, then the old is destroyed. Critical for: ACM certificates (new cert must be valid before old is removed from ALB), RDS instances, any resource where the replacement must be healthy before the original is deleted.
+
+**Q235. What is `terraform import` and when would you use it in FleetOps?**
+`terraform import RESOURCE_ADDRESS REAL_ID` adds an existing AWS resource to Terraform state without creating it. Use case: an S3 bucket or RDS instance was created manually before Terraform was set up. After import, Terraform knows about it and can manage updates/destroy. You must write the corresponding resource block manually â€” import only updates state, doesn't generate config.
+
+**Q236. How does Checkov integrate into the FleetOps CI/CD pipeline?**
+Checkov runs `checkov -d fleetops-terraform/ --skip-check CKV_AWS_xxx` in the Terraform CI workflow (`.github/workflows/terraform.yml`) after `terraform validate` but before `terraform plan`. It scans all `.tf` files for 500+ security/compliance checks (encryption at rest, public access, logging enabled, etc.). Failures block the pipeline. `#checkov:skip=CKV_AWS_260:reason` inline comments suppress known false positives.
+
+**Q237. What is `terraform taint` and has it been replaced?**
+`terraform taint RESOURCE` marked a resource for forced replacement on next apply â€” useful for forcing recreation without changing config. It was deprecated in Terraform 1.0 and replaced by `terraform apply -replace=RESOURCE`. In FleetOps: `terraform apply -replace=module.eks_nodegroup.aws_eks_node_group.main` would force the node group to be recreated.
+
+**Q238. How does Terraform handle provider version conflicts between modules?**
+Each module can specify `required_providers` with version constraints. Terraform resolves a single provider version that satisfies all constraints using the dependency lock file (`.terraform.lock.hcl`). If two modules require incompatible versions (`>= 5.0` and `< 4.0`), Terraform errors with "no valid version." The lock file pins exact versions â€” `terraform providers lock` updates it after changing constraints.
+
+**Q239. What is the difference between `terraform.tfvars` and `prod.auto.tfvars`?**
+`terraform.tfvars` is automatically loaded by Terraform (must be named exactly this). Files matching `*.auto.tfvars` are also automatically loaded â€” `prod.auto.tfvars` is used in FleetOps to supply environment-specific values. Multiple `.auto.tfvars` files are all loaded (alphabetical order). `terraform.tfvars` is typically gitignored for secrets; `prod.auto.tfvars` in FleetOps contains secrets in plaintext â€” a known security debt to be addressed.
+
+**Q240. What is a Terraform workspace and does FleetOps use them?**
+Workspaces maintain separate state files for the same configuration â€” `terraform workspace new staging` creates a parallel state. FleetOps does NOT use workspaces â€” instead uses separate directories (`environments/prod/`, `environments/staging/` if added) with separate state keys. Directory-per-environment is preferred for strong isolation; workspaces share backend config and are easier to accidentally destroy cross-environment.
+
+**Q241. How does `terraform destroy` know what to delete?**
+`terraform destroy` reads the state file (from S3 backend) to get all managed resources and their real IDs, then calls the appropriate AWS API to delete each in reverse dependency order. It ONLY deletes resources tracked in state â€” manually created resources are unknown to Terraform. Resources with `deletion_protection` (like `enable_deletion_protection = true` on RDS) will fail â€” protection must be disabled first.
+
+**Q242. What does `terraform validate` check vs `terraform plan`?**
+`validate`: syntax check and type-checking of Terraform configuration files â€” no AWS API calls, no state access. Catches: undefined variables, invalid resource arguments, type mismatches, module interface violations. `plan`: calls AWS APIs to read current state, resolves references, computes actual changes. Catches: missing permissions, resource not found, value doesn't match constraint. Both run in CI â€” validate first (fast), then plan (slower, needs credentials).
+
+---
+
+### CI/CD â€” continued
+
+**Q243. What is a reusable workflow in GitHub Actions and how does FleetOps use it?**
+A reusable workflow (`workflow_call` trigger) is called from another workflow using `uses: ./.github/workflows/build.yml`. It accepts inputs and secrets from the caller. FleetOps: `build-push.yml` (reusable) handles Docker build + ECR push; called from service-specific workflows with `image-name`, `dockerfile-path` as inputs. This avoids duplicating 50+ lines of Docker build logic across 5 service workflows.
+
+**Q244. Explain the GitHub Actions OIDC flow step by step.**
+(1) Workflow step requests OIDC token from GitHub's token endpoint (automatic â€” `id-token: write` permission). (2) GitHub mints a JWT signed with its OIDC private key, containing `sub: repo:ORG/REPO:ref:refs/heads/main`, `aud: sts.amazonaws.com`. (3) `aws-actions/configure-aws-credentials` sends the JWT to STS `AssumeRoleWithWebIdentity`. (4) STS verifies JWT signature against GitHub's public JWKS endpoint. (5) STS checks the IAM role's trust policy â€” `Condition: StringLike: token.actions.githubusercontent.com:sub: repo:FleetOps-V2/*`. (6) STS returns temporary credentials (AccessKeyId, SecretAccessKey, SessionToken, expiry 1h). (7) Subsequent AWS CLI/SDK calls use these credentials.
+
+**Q245. Why does the CI workflow use `workflow_run` trigger for deployment?**
+`workflow_run` triggers a workflow when another workflow completes â€” enables sequential workflows across repositories or jobs. In FleetOps: the image-build workflow runs on push to main; deployment workflow triggers on `workflow_run: completed` of the build workflow, only if `conclusion: success`. This ensures deployment only happens after a successful build+push. `push` trigger on the same event would run both workflows simultaneously without ordering guarantee.
+
+**Q246. How does semantic versioning via Conventional Commits work in the CI pipeline?**
+The pipeline reads the commit message: `feat:` â†’ bumps minor (1.2.0 â†’ 1.3.0), `fix:` â†’ bumps patch (1.2.0 â†’ 1.2.1), `BREAKING CHANGE` in footer â†’ bumps major (1.2.0 â†’ 2.0.0). Tools like `semantic-release` or `standard-version` automate this. The computed version tags the Docker image in ECR (`1.3.0` and `latest`) and creates a GitHub Release. This enables rollback to any semantic version without tracking build numbers.
+
+**Q247. What is Docker layer caching and why does layer order matter?**
+Docker builds layers top-to-bottom. A layer is rebuilt when its instruction OR any preceding layer changes. Best practice: copy dependency files first (`pom.xml`), run dependency download (`mvn dependency:go-offline`), then copy source (`COPY src/ ./`), then build. If only source changes, the dependency layer is cached â€” build skips downloading all Maven dependencies. Wrong order (COPY all â†’ build) invalidates cache on every source change.
+
+**Q248. Explain multi-stage Docker builds for the Spring Boot services.**
+Stage 1 (`AS builder`): `FROM maven:3.9-eclipse-temurin-21` â€” copies pom.xml, downloads dependencies, copies src, runs `mvn package -DskipTests`. Produces a fat JAR. Stage 2 (`FROM eclipse-temurin:21-jre`): copies ONLY the fat JAR from stage 1. Final image has no Maven, no source code, no test dependencies â€” much smaller (typically 200-300MB vs 600MB+ for a full Maven image). Attack surface reduced significantly.
+
+**Q249. What does `mode=max` in Docker Buildx GHA cache backend do?**
+`cache-to: type=gha,mode=max` caches ALL layers including intermediate build stages (e.g., the Maven build stage). `mode=min` (default) caches only the final stage layers. With `mode=max`, a subsequent build that changes only `src/` can reuse the cached Maven dependency download layer from stage 1 â€” even though stage 1 is intermediate and not in the final image. This is the key difference that dramatically speeds up CI builds.
+
+**Q250. How does Trivy scan Docker images in CI and what does it report?**
+Trivy scans: OS packages (Alpine, Debian apt/dpkg), language packages (Maven pom.xml, npm package-lock.json), and application files for known CVEs. It pulls the CVE database from GitHub (`aquasecurity/trivy-db`). Reports findings by severity: CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN. Pipeline config: `--exit-code 1 --severity CRITICAL,HIGH` fails the build on any critical or high severity CVE. Output formats: table, JSON, SARIF (for GitHub Security tab upload).
+
+**Q251. What is SonarQube and what five quality gate metrics does FleetOps enforce?**
+SonarQube performs static code analysis. The quality gate in FleetOps enforces: (1) Coverage â‰¥80% (unit test line coverage), (2) Duplications â‰¤3% (duplicate code blocks), (3) Maintainability Rating = A (technical debt ratio <5%), (4) Reliability Rating = A (no bugs), (5) Security Rating = A (no vulnerabilities). Gate failure blocks merge to main. Coverage data is uploaded via `sonar-maven-plugin` after `mvn test`.
+
+**Q252. How does Snyk scan Maven dependencies?**
+`snyk test --file=pom.xml` reads the Maven dependency tree (including transitive dependencies), resolves all artifact coordinates, and queries Snyk's vulnerability database. It reports: CVE ID, affected package, vulnerable version range, fixed version, severity. CI config: `snyk monitor` uploads results to Snyk dashboard for continuous monitoring. `--fail-on=upgradable` only fails on CVEs with available fixes â€” avoids blocking on non-fixable vulnerabilities.
+
+**Q253. What is a GitHub Environment and how does it protect production deployments?**
+GitHub Environments (Settings â†’ Environments) apply protection rules to specific deployment jobs. Rules: `required_reviewers` (at least N approvals before deployment runs), `wait-timer` (delay N minutes after approval), `deployment_branches` (only allow from `main` or release/*). In FleetOps: `production` environment requires 1 reviewer. The deployment job is paused until an authorized user approves in the GitHub UI â€” preventing accidental pushes to prod.
+
+**Q254. How does the ArgoCD image updater work with ECR?**
+ArgoCD Image Updater watches ECR for new image tags matching a pattern (e.g., semver `^1\.[0-9]+\.[0-9]+`). When a new tag is found, it updates the image tag in the Git repository (via `git commit` to a dedicated branch or directly to the values file), which ArgoCD then syncs. This closes the GitOps loop: CI pushes image â†’ image updater commits tag change to Git â†’ ArgoCD syncs â†’ rolling deployment. No CI system needs kubectl access.
+
+**Q255. What is the difference between `git push --force` and `git push --force-with-lease`?**
+`--force` overwrites the remote ref regardless of its current state â€” can silently discard colleagues' pushed commits. `--force-with-lease` checks that the remote ref is at the expected SHA before pushing â€” fails if someone else pushed since your last fetch, preventing accidental overwrites. In CI/CD for tag pushes or Git-ops commits, `--force-with-lease` is the safe default when rewriting history is unavoidable.
+
+---
+
+### SECURITY â€” continued
+
+**Q256. What is the principle of least privilege and how is it applied in FleetOps?**
+Least privilege: grant only the minimum permissions needed for a function to operate. In FleetOps: each microservice's IRSA role allows only the specific Secrets Manager secrets it needs (e.g., auth-service role can read `fleetops/prod/db-credentials` and `fleetops/prod/jwt-secret` â€” not vehicle-service secrets). Lambda role allows only the specific SNS topics it publishes to. ESO role allows `secretsmanager:GetSecretValue` on `fleetops/prod/*` only.
+
+**Q257. How does BCrypt password hashing work and why is it chosen over SHA-256?**
+BCrypt applies a cost factor (strength 10 in FleetOps = 2^10 = 1024 iterations of the Blowfish key setup) per hash computation. Each hash includes a random 128-bit salt, so identical passwords produce different hashes â€” rainbow tables are useless. Cost factor is configurable â€” as hardware gets faster, increase it to maintain ~100ms+ hash time. SHA-256 is deterministic, fast (nanoseconds), and without a salt is trivially brute-forced. BCrypt is purpose-built for password storage.
+
+**Q258. What is a JWT and what are its three components?**
+JWT (JSON Web Token) has three base64url-encoded parts separated by dots: (1) Header: `{"alg":"HS256","typ":"JWT"}`, (2) Payload: claims â€” `{"sub":"user-id","role":"ADMIN","iat":1700000000,"exp":1700003600}`, (3) Signature: HMAC-SHA256 of `header.payload` using the secret key. The signature is verified server-side â€” tampering with any claim invalidates the signature. JWTs are stateless â€” no server-side session store needed (except for the Redis blacklist for revocation).
+
+**Q259. What is CSRF and how does FleetOps mitigate it?**
+CSRF (Cross-Site Request Forgery): attacker tricks an authenticated user's browser into making a state-changing request to your site (using the user's session cookie). Mitigation: FleetOps uses JWT in Authorization header (not cookies) â€” browser does not automatically send headers to cross-origin requests. CORS configuration (`cors_allowed_origins` from SSM) restricts which origins can make cross-origin requests. `SameSite=Strict` cookie attribute (if cookies were used) would also prevent CSRF.
+
+**Q260. What is SQL injection and how does Spring Data JPA prevent it?**
+SQL injection: attacker inserts SQL into user input that gets executed as part of a query. Example: `username = "admin'; DROP TABLE users; --"`. Spring Data JPA uses parameterized queries: `findByUsername(String username)` generates `SELECT * FROM users WHERE username = ?` with the input bound as a parameter â€” the driver sends data and SQL separately, so the database never interprets user input as SQL. `@Query` with JPQL also uses positional parameters â€” never string concatenation.
+
+---
+
+### PROJECT-SPECIFIC â€” continued
+
+**Q261. Walk through what happens when `terraform apply` is run for the first time.**
+(1) S3 backend initialization â€” creates state bucket if needed, acquires DynamoDB lock. (2) Parallel: KMS, networking, route53 (no dependencies). (3) Parallel: IAM (needs OIDC â€” must wait for eks_oidc, which needs eks_cluster), RDS (needs networking, KMS), Redis, S3, EFS, SNS, SSM. (4) EKS cluster â†’ OIDC â†’ node group â†’ addons (depends on nodegroup + secrets_manager). (5) ECR, CloudWatch, CloudTrail, Config, WAF, ACM (needs route53 for DNS validation). (6) CloudFront (needs ACM, WAF). (7) Lambda, EventBridge, Step Functions. (8) Inline SG rules, Route53 alias records (need ALB â€” created by addons). Full apply: ~45-60 minutes.
+
+**Q262. Why does `data.aws_lb.fleetops` have `depends_on = [module.eks_addons]`?**
+The ALB is created by the ALB Ingress Controller (installed in `eks_addons`) when ArgoCD syncs the Ingress resource. It does not exist in Terraform state â€” Terraform discovers it via `data.aws_lb` using tags. `depends_on` ensures Terraform doesn't attempt to read the ALB data source before `eks_addons` finishes (which provisions the controller and bootstraps ArgoCD, which syncs the Ingress). Without it, the data source would fail with "no matching load balancer found."
+
+**Q263. What would you do if a pod is stuck in `Pending` state?**
+`kubectl describe pod PODNAME -n fleetops-prod` â†’ Events section shows why. Common causes: (1) Insufficient resources â€” `0/2 nodes are available: 2 Insufficient cpu` â†’ scale node group or reduce requests, (2) Volume not available â€” `waiting for a volume to be created` â†’ check PVC/PV status, (3) ImagePullBackOff â€” wrong ECR URI or missing IRSA permission for `ecr:GetAuthorizationToken`, (4) Taint/toleration mismatch â†’ check node taints, (5) NodeSelector mismatch â†’ check labels.
+
+**Q264. How would you roll back a bad deployment in FleetOps?**
+Option 1 (GitOps â€” preferred): revert the offending commit in Git â†’ ArgoCD detects â†’ re-syncs to previous manifest version â†’ rolling update back to previous image. Option 2 (ArgoCD UI): History â†’ select previous revision â†’ Rollback â†’ ArgoCD applies previous state. Option 3 (kubectl fallback): `kubectl rollout undo deployment/fleetops-auth-service -n fleetops-prod` â†’ K8s reverts to previous ReplicaSet. GitOps rollback is preferred â€” it keeps Git as the source of truth.
+
+**Q265. What is the fleetops-prod namespace and what does it contain?**
+`fleetops-prod` is the primary application namespace. Contains: 4 backend Deployments, 1 frontend Deployment, 5 ClusterIP Services, 1 Ingress (ALB), 5 ServiceAccounts (one per service with IRSA annotation), ConfigMaps (app config from SSM via ESO), Secrets (DB creds, JWT secret â€” synced from Secrets Manager via ESO), HPAs for each backend service, PVC for EFS (maintenance-service media storage).
+
+**Q266. How does auth-service validate a JWT from a downstream request?**
+Other services forward the `Authorization: Bearer <token>` header to auth-service's `/api/auth/validate` endpoint. Auth-service: (1) extracts the token, (2) parses the header+payload (base64url decode), (3) recomputes HMAC-SHA256 of `header.payload` using the JWT secret from Secrets Manager, (4) compares with the token's signature â€” if mismatch, returns 401, (5) checks `exp` claim â€” if expired, returns 401, (6) checks Redis blacklist â€” if found (logged out), returns 401, (7) returns user ID + role in response body.
+
+**Q267. What is the request-service and what external integrations does it trigger?**
+Request-service manages fleet service requests (repairs, inspections, insurance claims). On POST `/api/requests`: validates JWT, stores ServiceRequest in RDS, publishes to SNS â†’ EventBridge rule matches â†’ Lambda enriches and routes to: insurance SNS topic (for insurance-related requests) or service SNS topic (for maintenance requests). Lambda also calls Step Functions to start approval workflow for high-priority requests. Separate from maintenance-service which handles the actual work orders.
+
+**Q268. Why is the vehicle-service also responsible for GPS tracking (`/api/tracking`)?**
+Vehicle tracking data (GPS coordinates, speed, status) is logically part of the vehicle domain â€” the same aggregate that owns the vehicle's identity, registration, and assignment. Putting tracking in a separate service would require cross-service joins for common queries like "show all vehicles with their current locations." The Ingress routes both `/api/vehicles` and `/api/tracking` to vehicle-service on port 8080.
+
+**Q269. What is the fleetops-system namespace used for?**
+`fleetops-system` hosts infrastructure/platform components: ArgoCD (Argo CD server, repo-server, application-controller, redis, dex), External Secrets Operator (controller + webhook), ClusterSecretStore (cluster-scoped ESO resource). These components serve all application namespaces â€” keeping them in a separate namespace enables RBAC isolation (only platform team has write access to fleetops-system).
+
+**Q270. How would you debug a 502 Bad Gateway from the ALB?**
+502 means ALB received an invalid response from the backend pod. Steps: (1) Check ALB access logs in S3/CloudWatch â€” which target IP returned the error, (2) `kubectl logs POD -n fleetops-prod` â€” look for startup errors or exceptions, (3) Check readiness probe â€” if pod is marked unhealthy, it may be receiving traffic briefly during state transition, (4) Check `alb.ingress.kubernetes.io/healthcheck-path` â€” if /actuator/health returns non-200, ALB marks target unhealthy, (5) Check security groups â€” ALB SG must allow egress to pod IPs on 8080.
+
+---
+
+### AWS DEEP DIVE â€” continued
+
+**Q271. What is an IAM instance profile vs. an IAM role vs. IRSA?**
+IAM instance profile: attaches an IAM role to an EC2 instance â€” all processes on the instance share that role via the IMDS endpoint. IAM role for nodes (instance profile): used by kubelet and node-level processes. IRSA (IAM Roles for Service Accounts): maps a K8s ServiceAccount to an IAM role via OIDC â€” pod-level granularity. Each pod only gets credentials for its own role, not the node role. IRSA is strictly more secure â€” compromising one pod doesn't expose other pods' permissions.
+
+**Q272. How does EKS handle Kubernetes version upgrades?**
+Process: (1) Update control plane: `aws eks update-cluster-version` â€” AWS performs rolling update of control plane components, no downtime, takes ~20min. (2) Update add-ons: VPC CNI, CoreDNS, kube-proxy must be updated to versions compatible with the new K8s version. (3) Update node group: EKS launches new nodes with the new K8s-version AMI, cordons and drains old nodes (respecting PDBs), terminates them. Applications continue serving traffic on old nodes until new nodes are ready.
+
+**Q273. What are EKS add-ons vs. self-managed add-ons?**
+EKS managed add-ons (VPC CNI `aws-node`, CoreDNS, kube-proxy, EBS CSI): installed/updated via EKS API â€” AWS manages compatibility with the cluster version, provides one-click updates, reports health status. Self-managed (ALB Ingress Controller, External Secrets Operator, ArgoCD, Fluent Bit, metrics-server): installed via Helm, you manage version compatibility and updates. FleetOps uses Terraform Helm releases for self-managed add-ons in `module.eks_addons`.
+
+**Q274. What is the AWS VPC CNI plugin and why is it important for FleetOps?**
+VPC CNI allocates real VPC IP addresses to pods from the node's ENIs (secondary private IPs). Each node gets 1 primary ENI + N secondary ENIs (depending on instance type). Each ENI gets M IPs. `m5.large`: 3 ENIs Ã— 10 IPs = 30 pod IPs per node. Pods with VPC IPs are directly routable within the VPC â€” enables ALB `target-type: ip` (register pod IPs directly, not node IPs) and allows RDS/ElastiCache to apply SG rules to pod traffic by source IP.
+
+**Q275. What happens when an ALB target group has no healthy targets?**
+ALB returns 503 Service Unavailable to all incoming requests. This happens when: all pod readiness probes fail (e.g., RDS is down, so /actuator/health returns DOWN), during deployment when old pods terminate before new pods pass probes (prevented by `maxUnavailable: 0`), or when all pods OOMKill and restart simultaneously. Mitigation: proper PDB, correct probe thresholds, min-replicas â‰¥ 2, HPA to add capacity under load.
+
+**Q276. How does CloudFront origin failover work if ALB is unavailable?**
+CloudFront supports origin groups with primary + secondary origins and failover criteria (HTTP status codes). If the primary origin (ALB) returns 5xx, CloudFront retries the request on the secondary origin. FleetOps doesn't currently implement origin failover â€” a simpler mitigation is ALB multi-AZ (ALB is already multi-AZ by default) and EKS nodes across 3 AZs so pod failures in one AZ don't take down the service.
+
+**Q277. What is an SQS dead-letter queue and could FleetOps benefit from one?**
+DLQ: after N failed delivery attempts on an SQS queue, messages are moved to the DLQ for inspection/retry. FleetOps doesn't use SQS directly â€” SNS delivers to Lambda and email. But if Lambda fails to process an alert event N times (configurable), SNS moves it to a DLQ. This prevents event loss during Lambda errors. An SQS subscription with DLQ would be a resilience improvement over direct Lambda subscription.
+
+**Q278. What is the difference between synchronous and asynchronous Lambda invocation?**
+Synchronous: caller waits for Lambda response â€” e.g., API Gatewayâ†’Lambda, ALBâ†’Lambda. Errors returned to caller. Asynchronous: caller returns immediately (202 Accepted) â€” e.g., EventBridgeâ†’Lambda, SNSâ†’Lambda. Lambda retries on failure (up to 2 retries). After retries exhausted, event goes to DLQ (if configured) or is lost. FleetOps: EventBridge invokes alert-processor Lambda asynchronously â€” caller (EventBridge) doesn't wait for Lambda result.
+
+**Q279. How does Step Functions handle Lambda execution failures?**
+State machine definition includes `Catch` and `Retry` fields per Task state. `Retry`: on `Lambda.ServiceException`, retry up to 3 times with exponential backoff. `Catch`: if all retries fail, transition to a `Fail` state or `Fallback` handler. Standard Workflows store all execution history â€” you can inspect each state transition, input/output, and error in the console. Failed executions can be re-driven from the point of failure.
+
+**Q280. What is the Bedrock invocation model for FleetOps?**
+FleetOps calls `bedrock:InvokeModel` (synchronous, on-demand) for the Nova Lite model. Request: `POST /model/amazon.nova-lite-v1:0/invoke` with JSON body containing `messages` array and `inferenceConfig`. Response: generated text. No streaming in the basic integration. Cost: per-token pricing (input + output). For production, consider Bedrock Provisioned Throughput (reserved capacity, predictable latency) for consistent SLA.
+
+---
+
+### KUBERNETES â€” continued
+
+**Q281. What is pod topology spread and why would you configure it?**
+`topologySpreadConstraints` distributes pods evenly across topology domains (zones, nodes). Example: `maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: DoNotSchedule` â€” ensures pods are spread across AZs with no more than 1 extra pod in any zone vs. the minimum. With 2 pods across 3 AZs, pods land in 2 different AZs â€” AZ failure takes down at most 1 pod. Without constraints, scheduler may colocate both in the same AZ.
+
+**Q282. How does kubelet manage container startup with init containers?**
+Init containers run sequentially before app containers start. Each init container must exit 0 before the next starts. Use cases: wait for a dependency to be ready (`until curl http://db:5432; do sleep 2; done`), run database migrations (Flyway), seed config. If an init container fails, kubelet restarts it according to the pod's `restartPolicy`. App containers don't start until all init containers succeed.
+
+**Q283. What is the containerd runtime and how does it relate to Docker?**
+containerd is the industry-standard container runtime (CNCF graduated). Docker itself uses containerd internally. EKS nodes use containerd directly (Docker was deprecated as a K8s runtime in 1.24). kubelet calls containerd via CRI (Container Runtime Interface). containerd calls runc (OCI runtime) to actually create Linux namespaces and cgroups. Image format is OCI-compliant â€” Docker images work without modification.
+
+**Q284. What is a Kubernetes Admission Controller?**
+Admission controllers intercept API server requests after authentication/authorization but before persistence. Two types: Mutating (can modify the request â€” e.g., Pod Identity Webhook adds projected volume for OIDC token) and Validating (can approve/reject â€” e.g., reject pods without resource limits). Implemented as webhooks: API server sends AdmissionReview JSON to a webhook server, receives approve/deny/patch response.
+
+**Q285. How does the Pod Identity Webhook work for IRSA?**
+The webhook is a MutatingAdmissionWebhook. When a pod is created with a ServiceAccount annotated with `eks.amazonaws.com/role-arn`, the webhook mutates the PodSpec: adds a projected volume (ServiceAccountToken with audience `sts.amazonaws.com`, expiry 86400s) at `/var/run/secrets/eks.amazonaws.com/serviceaccount/token`, and sets env vars `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`. The AWS SDK automatically uses these to call STS.
+
+**Q286. What happens when a Secret referenced by a pod doesn't exist?**
+If the Secret is referenced as an environment variable (`envFrom: secretRef`) or volume mount, the pod stays in `Pending` state with event: `couldn't find key X in Secret namespace/name`. The pod won't start until the Secret exists. This is why ArgoCD sync waves matter â€” ExternalSecret must reconcile and create the K8s Secret (wave 2) before Deployments start (wave 4). Without ordering, pods fail to start and ESO races to create secrets.
+
+**Q287. How does Kubernetes garbage collection work for completed pods?**
+Completed pods (Job pods that finished, or failed pods) accumulate unless cleaned up. `ttlSecondsAfterFinished` on Jobs auto-deletes the pod after N seconds. For Deployment pods: old ReplicaSets are kept up to `revisionHistoryLimit` (default 10). Kubernetes also has a garbage collection controller that removes orphaned resources â€” when a Deployment is deleted, its ReplicaSets and pods are garbage collected.
+
+**Q288. What is etcd and what data does it store for FleetOps?**
+etcd is the distributed key-value store that backs the Kubernetes API server â€” all cluster state is persisted here: every Pod, Deployment, Service, ConfigMap, Secret, Ingress, CRD, etc. EKS manages etcd â€” it runs in the control plane (multi-AZ, managed by AWS, not visible to users). Data is encrypted at rest using the KMS key specified in `kms_secrets_key_arn`. etcd uses the Raft consensus algorithm â€” a quorum (majority) of etcd members must agree on each write.
+
+**Q289. How does Kubernetes handle a node failure?**
+Node controller detects node as `NotReady` after `node-monitor-grace-period` (40s default). After `pod-eviction-timeout` (5min default), pods on the failed node are evicted (marked for deletion). The ReplicaSet controller sees fewer replicas than desired and schedules replacements on healthy nodes. With PDBs: ensures minimum available replicas during voluntary disruptions. For node failure (involuntary): PDB doesn't block eviction â€” evictions proceed regardless to restore desired replica count.
+
+**Q290. What is a StatefulSet and when would FleetOps need one?**
+StatefulSet provides: stable pod names (pod-0, pod-1), stable network identity (DNS: pod-0.service.namespace.svc.cluster.local), ordered deployment/scaling, persistent volume claims per pod (not shared). FleetOps doesn't currently use StatefulSets â€” all services are stateless (Deployments). If running a database (PostgreSQL, Redis) inside K8s, StatefulSets would be required for stable storage. FleetOps offloads statefulness to managed AWS services (RDS, ElastiCache).
+
+---
+
+### TERRAFORM â€” continued
+
+**Q291. What is `for_each` in Terraform and when would you use it over `count`?**
+`for_each = var.subnet_map` creates one resource instance per map entry, keyed by the map key. If you remove an item from the middle of a `count` list, Terraform renumbers all subsequent instances and recreates them. `for_each` instances are keyed by the map key â€” removing one entry only affects that specific instance, leaving others untouched. Use `for_each` for any resource where stable identity matters (subnets, IAM policies, security groups).
+
+**Q292. How does Terraform handle sensitive values in state?**
+Terraform marks values from `sensitive = true` variables and outputs as `(sensitive)` in CLI output (plan/apply) â€” they're not printed. However, they ARE stored in plaintext in the state file (S3 in FleetOps). The state file must be protected: S3 bucket with encryption (KMS), versioning, block-public-access, access logging, and strict IAM bucket policies. This is the known FleetOps security debt â€” secrets in `prod.auto.tfvars` and state need rotation before evaluation.
+
+**Q293. What is a Terraform data source and give an example from FleetOps?**
+Data sources read existing infrastructure without managing it. `data "aws_lb" "fleetops"` looks up the ALB created by the K8s ALB Ingress Controller using tag filters â€” Terraform didn't create it, but reads its DNS name and zone ID to create Route53 alias records. Other examples: `data "aws_caller_identity" "current"` reads the current AWS account ID (used in ARN construction), `data "aws_availability_zones" "available"` reads AZs without hardcoding them.
+
+**Q294. How does Terraform provider `exec` block work for EKS authentication?**
+The `helm` and `kubernetes` providers need to authenticate to the EKS API server. The `exec` block runs an external command to generate credentials: `aws eks get-token --cluster-name CLUSTER_NAME` outputs a kubeconfig-compatible token. Terraform runs this command at plan/apply time and uses the output as the Bearer token for API calls. This avoids storing cluster credentials in Terraform config.
+
+**Q295. What is the purpose of `try()` in the provider configuration?**
+`try(module.eks_cluster.cluster_endpoint, "")` returns the first argument if it's not an error, otherwise returns the fallback. During initial `terraform plan` (before eks_cluster exists), `module.eks_cluster.cluster_endpoint` would be null/unknown â€” `try()` returns `""` and the provider initializes without crashing. Without `try()`, the plan would fail because the provider can't initialize with a null endpoint.
+
+---
+
+### CI/CD â€” continued
+
+**Q296. What is a GitHub Actions matrix strategy?**
+`strategy.matrix` runs a job multiple times with different variable combinations. Example: `matrix: service: [auth, vehicle, maintenance, request, frontend]` â€” runs 5 parallel jobs, each with a different `service` value. Used in FleetOps to build and push all 5 services in parallel rather than sequentially â€” reduces total CI time from ~NÃ—M minutes to ~M minutes (longest single build).
+
+**Q297. How does `actions/cache` differ from Docker Buildx GHA cache?**
+`actions/cache`: caches arbitrary files between workflow runs (Maven `.m2` repository, node_modules). Keyed by a cache key (e.g., hash of `pom.xml`). Restored at job start, saved at job end. Docker Buildx GHA cache: caches Docker layer blobs in the GitHub Actions cache backend â€” not individual files but BuildKit content-addressed layers. Both use the same underlying cache storage but serve different purposes.
+
+**Q298. What is a GitHub Actions self-hosted runner and does FleetOps use one?**
+Self-hosted runners run on your own infrastructure (EC2, EKS pod, on-prem server). Advantages: access to private VPC resources, persistent cache, custom hardware (GPU), no GitHub-hosted runner time limits. FleetOps uses GitHub-hosted runners (`ubuntu-latest`) â€” simpler, no infrastructure to manage, but no direct VPC access. Lambda and EKS deployments use OIDC credentials to reach AWS APIs â€” no VPC access needed.
+
+**Q299. How would you implement a canary deployment for FleetOps?**
+Option 1 (ArgoCD Rollouts): install Argo Rollouts, use `Rollout` resource instead of `Deployment`, specify canary strategy: send 10% traffic to new version, pause, increment to 50%, pause, 100%. Traffic split via ALB weighted target groups. Option 2 (manual): deploy new version as separate Deployment with 1 replica alongside existing (10 replicas), monitor errors, gradually shift traffic by adjusting replica counts. ArgoCD Rollouts is the GitOps-native approach.
+
+**Q300. What happens if the GitHub Actions OIDC token is stolen?**
+The token expires in 10 minutes (GitHub OIDC token lifetime) â€” usability window is very short. The IAM role's trust policy has conditions: `StringLike token.actions.githubusercontent.com:sub: repo:FleetOps-V2/*` â€” the stolen token is only valid if used before expiry AND from a role the attacker can assume (they'd need to make STS calls). STS logs show the AssumeRoleWithWebIdentity call with the caller's IP â€” easily detectable in CloudTrail. No long-lived credentials exist to steal.
+
+---
+
+### SECURITY â€” continued
+
+**Q301. What is the OWASP Top 10 and which are most relevant to FleetOps?**
+OWASP Top 10 (2021): A01 Broken Access Control, A02 Cryptographic Failures, A03 Injection, A04 Insecure Design, A05 Security Misconfiguration, A06 Vulnerable Components, A07 Auth Failures, A08 Software Integrity Failures, A09 Logging Failures, A10 SSRF. Most relevant to FleetOps: A01 (JWT role enforcement â€” ADMIN endpoints), A02 (plaintext secrets in tfvars â€” known debt), A03 (parameterized JPA queries), A06 (Snyk/Trivy scanning), A07 (BCrypt, JWT expiry, Redis blacklist).
+
+**Q302. How does CORS work and how is it configured in FleetOps?**
+CORS (Cross-Origin Resource Sharing): browser blocks cross-origin requests unless the server includes `Access-Control-Allow-Origin` header. Spring Boot services have `@CrossOrigin` or global `CorsConfiguration` with `allowedOrigins: [https://fleetops.website]` (from SSM `cors_allowed_origins`). Preflight OPTIONS requests return `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`. Without CORS config, browser blocks API calls from the React frontend.
+
+**Q303. What is certificate pinning and is it used in FleetOps?**
+Certificate pinning: client hardcodes the expected certificate fingerprint or public key for a server â€” rejects connections even if a technically-valid (but unexpected) cert is presented. Protects against CA compromise or MITM with a fraudulent cert. FleetOps does NOT implement pinning â€” it relies on standard TLS certificate validation via ACM and Route53. Mobile apps sometimes pin; web applications typically don't (breaks on cert renewal).
+
+**Q304. How does FleetOps protect against brute force login attempts?**
+WAFv2 rate-based rule (2000 requests per 5-minute window per IP) blocks IPs making too many requests â€” limits brute force login attempts. Auth-service could additionally implement account lockout (lock after N failed attempts) or exponential delay. CloudWatch alarm on high 4xx rate to `/api/auth/login` can trigger SNS alert. BCrypt's intentional slowness (~100ms per hash) also limits brute force to ~10 attempts/second per attacker.
+
+**Q305. What is TLS termination and where does it happen in FleetOps?**
+TLS termination: decrypt HTTPS at a termination point, then forward as HTTP internally. In FleetOps: first termination at CloudFront edge (TLS from client â†’ CloudFront). CloudFront then connects to ALB via HTTPS (TLS from CloudFront â†’ ALB, using the same ACM cert on the ALB). ALB terminates TLS and forwards HTTP to pod port 8080. Pod-to-pod communication is HTTP (within the cluster private network). End-to-end: client â†” CloudFront â†” ALB â†” Pod.
+
+**Q306. What is least-privilege IAM and how would you audit it?**
+Audit steps: (1) CloudTrail â†’ Athena query to find actual API calls per IAM role over 90 days, (2) Compare against policy statements â€” any Action never called is over-permissive, (3) IAM Access Analyzer identifies resources shared externally, (4) IAM policy simulator tests specific actions. Tools: `aws iam generate-service-last-accessed-details` shows last-used date per service. Remove permissions for services not used in 90 days. For FleetOps: verify each IRSA role only calls what it needs.
+
+**Q307. What is a supply chain attack and how does FleetOps defend against it?**
+Supply chain attack: compromise a dependency or build tool to inject malicious code into legitimate software. Example: `event-stream` npm package compromise (2018). FleetOps defenses: Snyk scans Maven transitive dependencies for known-compromised packages, Trivy scans the final Docker image for OS-level vulnerabilities, ECR image scanning runs after push, `pom.xml` pins exact versions (no floating `LATEST`), GitHub Actions pins `uses: actions/checkout@v4` (fixed SHA). SigStore/cosign image signing would add provenance verification.
+
+**Q308. What is the difference between authentication and authorization?**
+Authentication (AuthN): verify identity â€” "who are you?" JWT token contains `sub` (user ID) and is validated by checking signature + expiry. Authorization (AuthZ): verify permission â€” "are you allowed to do this?" Spring Security `@PreAuthorize("hasRole('ADMIN')")` checks the `role` claim in the JWT. FleetOps: auth-service handles AuthN (issue/validate tokens); each backend service handles AuthZ (check role before executing business logic). These are deliberately separated.
+
+**Q309. What are Kubernetes Secrets security concerns?**
+K8s Secrets are base64-encoded (NOT encrypted) by default in etcd â€” easily decoded. Anyone with `kubectl get secret` permission can read values. EKS addresses this with `kms_secrets_key_arn` â€” EKS encrypts Secret values in etcd using KMS (envelope encryption: data encrypted with a data key, data key encrypted with CMK). External Secrets Operator (IRSA) further reduces risk: secrets stay in Secrets Manager; K8s Secret is a temporary copy with an ownerReference that ESO controls.
+
+**Q310. What is the AWS Shared Responsibility Model?**
+AWS manages security OF the cloud (physical infrastructure, hypervisor, managed service internals â€” e.g., RDS OS patches, EKS control plane). Customer manages security IN the cloud (IAM policies, security groups, OS patches on EC2/EKS nodes, application code, data encryption, network ACLs). For EKS: AWS manages control plane (API server, etcd); you manage node AMI updates, pod security, RBAC, network policies, application vulnerabilities.
+
+---
+
+### PROJECT-SPECIFIC â€” continued
+
+**Q311. How would you add a new microservice to FleetOps?**
+(1) Create GitHub repo with Spring Boot app, Dockerfile, Helm chart or raw manifests. (2) Add ECR repository in Terraform (`module.ecr`). (3) Add IAM role for IRSA with required permissions. (4) Add Secrets Manager secrets and SSM parameters for the service. (5) Add K8s manifests: Deployment, Service, ServiceAccount, HPA, ExternalSecret, ConfigMap. (6) Add Ingress path in `ingress.yaml`. (7) Add GitHub Actions workflow for CI/CD. (8) Add ArgoCD Application manifest. (9) Update ALB security group if new port needed.
+
+**Q312. What would you monitor to detect a security incident in FleetOps?**
+CloudTrail: unusual IAM API calls (new user created, policy attached, role assumed from unknown IP). CloudWatch: spike in 401/403 responses (brute force or stolen token reuse), unusual Secrets Manager GetSecretValue calls. WAF: sudden IP block increase (scanning). GuardDuty (not in FleetOps but recommended): ML-based threat detection â€” DNS exfiltration, EC2 cryptocurrency mining, IAM credential compromise. X-Ray: unusual service graph changes (SSRF attempts hitting internal IPs).
+
+**Q313. How would you handle a database migration that requires downtime?**
+FleetOps uses Flyway â€” migrations run at application startup before traffic is served (Spring Boot auto-apply). For zero-downtime migrations: (1) Deploy migration that only adds columns/tables (backward compatible), (2) Deploy new code that writes to both old and new columns, (3) Backfill data, (4) Deploy code that reads from new column only, (5) Deploy migration that drops old column. Each step is a separate deployment â€” no downtime. Flyway ensures migrations run exactly once per environment.
+
+**Q314. What is the fleetops-terraform state file and what's the risk if it's deleted?**
+State file at `s3://fleetops-terraform-state-johan/environments/prod/terraform.tfstate` tracks all 100+ managed resources with their real AWS IDs and current attribute values. If deleted: Terraform loses knowledge of what it manages. `terraform plan` thinks all resources need to be created â€” running `apply` would try to create duplicates (most would fail with "already exists") or worse, create parallel resources. Recovery: `terraform import` for each resource (tedious). Protection: S3 versioning (enabled) allows restoration of the state file.
+
+**Q315. Describe the end-to-end latency budget for a typical API request.**
+DNS: ~1ms (Route53 cached). TLS handshake: ~20ms (CloudFront edge). CloudFrontâ†’ALB: ~5ms (within AWS). ALB target registration: ~1ms. Network to pod: ~1ms (VPC routing). Spring Boot processing: ~10-50ms (typical CRUD with HikariCP + SQL). SQL query: ~2-10ms (RDS, indexed). Redis cache hit: ~1ms. Response back: ~5ms. Total: ~40-90ms P50 for a cache-miss CRUD operation. X-Ray shows the breakdown per segment. SLO target: P99 < 500ms.
+
+**Q316. Why are there four separate GitHub repositories (one per service)?**
+Independent deployability: each service has its own CI/CD pipeline triggered by its own commits. A change to vehicle-service triggers only the vehicle-service build â€” not auth-service or frontend builds. Independent versioning: each service has its own semantic version (auth-service v1.5.2, vehicle-service v2.1.0). Blast radius: a broken build in maintenance-service doesn't block vehicle-service deployments. Trade-off: cross-service changes require coordinated PRs; no atomic commits across services.
+
+**Q317. What is the difference between the `fleetops-deployments` repo and the service repos?**
+Service repos (`fleetops-auth-service`, etc.): contain application source code, Dockerfile, Maven config, unit tests, CI workflow. `fleetops-deployments`: contains only Kubernetes manifests and Helm values â€” no application code. ArgoCD watches `fleetops-deployments` for changes and syncs to the cluster. This separation is the GitOps pattern: build artifacts (images) come from CI; deployment config comes from a separate repo controlled by platform/ops team. Changes to deploy config don't require rebuilding the application.
+
+**Q318. How does the frontend communicate with backend services?**
+React app (running in browser) makes fetch/axios calls to `https://fleetops.website/api/*`. CloudFront routes `/api/*` to the ALB origin. ALB matches the path and forwards to the appropriate backend service pod. The React app sets `Authorization: Bearer <token>` header on authenticated requests. No direct pod IPs or internal DNS â€” everything goes through the CloudFrontâ†’ALBâ†’pod path. During local development, a proxy in `vite.config.ts` forwards `/api/*` to localhost:808x.
+
+**Q319. What would happen if the JWT secret was rotated?**
+All existing issued JWTs would immediately become invalid â€” signature verification would fail because the secret no longer matches. All logged-in users would be forced to re-authenticate. In FleetOps: JWT secret is in Secrets Manager â†’ ESO syncs to K8s Secret â†’ pods read via env var (injected at startup). To rotate without mass logout: (1) Support two valid secrets simultaneously (current + previous), (2) Deploy code update, (3) After all old JWTs expire (~1h), remove previous secret. Spring Security's `JwtDecoder` can accept multiple keys.
+
+**Q320. What is the purpose of the `bedrock_access_key` and `bedrock_secret_key` variables in Terraform?**
+These are static AWS credentials for Bedrock access â€” passed from `prod.auto.tfvars` into `module.eks_addons` and stored in a K8s Secret or ConfigMap for the service that calls Bedrock's `InvokeModel` API. This is a known security debt â€” static credentials should be replaced with IRSA (add `bedrock:InvokeModel` to the relevant service's IAM role). Static credentials in `tfvars` violate the least-privilege and no-long-lived-credentials principles.
+
+---
+
+### GENERAL ARCHITECTURE â€” continued
+
+**Q321. What is the CAP theorem and how does it apply to FleetOps?**
+CAP: distributed systems can guarantee at most two of three: Consistency (all nodes see same data), Availability (every request gets a response), Partition Tolerance (system works despite network splits). RDS (single writer): CP â€” strong consistency, sacrifices availability during failover. ElastiCache Redis (single node): CA â€” consistent and available, but no partition tolerance. S3: highly available and partition-tolerant, eventual consistency for overwrite PUTs. FleetOps accepts brief unavailability (CP) for the database in exchange for data correctness.
+
+**Q322. What is eventual consistency and where does it appear in FleetOps?**
+Eventual consistency: all nodes will eventually agree on a value, but there may be a window of inconsistency. In FleetOps: ESO secret sync (Secrets Manager value â†’ K8s Secret) has up to ~1h lag. CloudFront cache (static assets): a deployed frontend update may not be visible at all edge locations instantly (short TTL + cache invalidation mitigates). S3 object listing after a delete may briefly still show the object. RDS read replica (if added): replica lags primary by milliseconds to seconds.
+
+**Q323. What is idempotency and why does it matter for Lambda and Step Functions?**
+Idempotency: calling the same operation multiple times produces the same result as calling it once. SNS delivers at-least-once â†’ Lambda may be invoked multiple times with the same event. If Lambda inserts a DB record without idempotency check, duplicates result. Mitigation: use a unique event ID as a primary key or deduplication ID (SNS `MessageDeduplicationId`), check for existing record before insert. Step Functions Standard Workflow execution is idempotent by execution name â€” retrying with the same name returns the existing execution.
+
+**Q324. What is blue-green deployment and how would you implement it on FleetOps?**
+Blue-green: maintain two identical production environments; switch traffic between them for zero-downtime releases. On EKS: run blue (current) and green (new) Deployments simultaneously, update the Service selector or Ingress to point to green, verify, then scale blue to 0. Or use ALB weighted target groups (via Argo Rollouts). More expensive (double infrastructure during transition) than rolling updates, but provides instant rollback: just switch the selector back to blue.
+
+**Q325. What is service mesh and does FleetOps use one?**
+A service mesh (Istio, Linkerd, AWS App Mesh) adds a sidecar proxy to every pod that handles: mTLS between services, fine-grained traffic control (canary, circuit breaker, retry), distributed tracing, and telemetry â€” without changing application code. FleetOps does NOT use a service mesh â€” it's an additional complexity layer appropriate for large-scale microservice deployments with many teams. X-Ray SDK provides tracing without a mesh. mTLS between pods is not implemented â€” pods communicate over plain HTTP within the cluster.
+
+**Q326. What is observability's three pillars and how are they covered in FleetOps?**
+(1) Metrics: CloudWatch metrics â€” ALB request count/latency/5xx, EKS CPU/memory, RDS connections/CPU, custom application metrics via CloudWatch SDK. (2) Logs: Fluent Bit DaemonSet â†’ CloudWatch Logs â€” all container stdout/stderr, structured JSON. (3) Traces: AWS X-Ray â€” distributed traces from ALB through Spring Boot services to RDS/Redis, showing per-service latency. Together: metrics alert you something is wrong, logs show what happened, traces show where in the call chain the issue is.
+
+**Q327. What is a circuit breaker pattern and how would you add it to FleetOps?**
+Circuit breaker: when a downstream service is failing repeatedly, stop calling it for a period (open circuit) instead of continuing to fail slowly. Three states: Closed (normal), Open (calls rejected immediately), Half-Open (test call â€” if succeeds, close; if fails, stay open). Resilience4j is the standard Java library. Example: vehicle-service calls Redis; if Redis is down, circuit opens, calls return cached-null or default, preventing thread pool exhaustion from slow Redis timeouts.
+
+**Q328. What would change in the architecture if FleetOps needed to serve 100x more traffic?**
+Database: RDS â†’ Aurora Global Database (multi-region read replicas, writes to primary region). Cache: Redis â†’ ElastiCache cluster mode (sharded, auto-scaling). EKS: larger instance types, cluster autoscaler, multi-region EKS clusters behind Route53 latency routing. CDN: CloudFront already scales automatically. Lambda: provisioned concurrency to eliminate cold starts at scale. ALB: already auto-scales. Application: review connection pool sizes (HikariCP), add Redis caching for read-heavy paths, introduce message queues (SQS) to absorb write spikes.
+
+**Q329. What is infrastructure as code and what are its benefits over manual provisioning?**
+IaC: infrastructure defined in code (Terraform HCL in FleetOps) â€” versioned, reviewed, and applied reproducibly. Benefits: (1) Reproducibility â€” `terraform apply` creates identical environments, (2) Version control â€” every change is a Git commit with author, reason, and diff, (3) Drift detection â€” `terraform plan` shows if manual changes were made, (4) Disaster recovery â€” destroy and recreate entire infrastructure in 45min from code, (5) Code review â€” infrastructure changes go through PR review like application code, (6) Automation â€” CI/CD pipeline for infrastructure changes.
+
+**Q330. How does cost optimization align with the architecture choices in FleetOps?**
+t3.micro/small instances (RDS, Redis): low-cost for training environment. Single-AZ ElastiCache (no replication): saves ~50% vs multi-AZ. EKS managed nodes with spot instances (optional): 70-90% savings over on-demand. S3 intelligent tiering: automatically moves infrequently accessed objects to cheaper storage class. ECR lifecycle policies: delete old images to reduce storage cost. Lambda (pay-per-invocation): zero cost when no alerts fire. CloudFront: reduces origin load (fewer requests to ALB = lower EC2 compute cost).
+
+---
+
+### AWS DEEP DIVE â€” continued
+
+**Q331. What is an ENI (Elastic Network Interface) and how does EKS use multiple ENIs?**
+ENI: virtual network card attached to an EC2 instance. Each ENI has a primary private IP and can have secondary private IPs. EKS VPC CNI attaches multiple ENIs to each node: ENI 1 (primary, node IP), ENI 2-N (secondary, allocated for pods). Each secondary IP is assigned to one pod. `m5.large` supports up to 3 ENIs Ã— 10 IPs = 30 pods. When ENI capacity is exhausted, VPC CNI allocates a new ENI. The IPAMD daemon on each node manages IP allocation.
+
+**Q332. What is AWS PrivateLink and could FleetOps use it?**
+PrivateLink creates a private endpoint for an AWS service inside your VPC â€” traffic never leaves the AWS network. Example: EKS pods calling Secrets Manager via a VPC endpoint don't traverse the internet or NAT Gateway. Benefits: no NAT Gateway data processing cost for AWS API calls, reduced attack surface, consistent latency. FleetOps could add VPC endpoints for: Secrets Manager, SSM, ECR (especially for large image pulls), S3, STS â€” each saves NAT Gateway data processing charges (~$0.045/GB).
+
+**Q333. What is an SQS FIFO queue vs. standard queue?**
+Standard: at-least-once delivery, best-effort ordering, unlimited throughput. FIFO: exactly-once processing, strict ordering within a message group, 300 messages/second (3000 with batching). FleetOps uses SNS (not SQS) for event delivery to Lambda â€” Lambda handles at-least-once with idempotency. If FleetOps needed guaranteed ordering for service request processing (e.g., status updates must apply in sequence), an SQS FIFO queue subscribed to SNS would be appropriate.
+
+**Q334. How does AWS auto-scaling of Lambda concurrency work?**
+Lambda scales by adding concurrent execution environments. Burst limit: 3000 initial burst, then +500/minute. If all environments are busy (no available slot within 1 second), Lambda returns a throttle error (429). Reserved concurrency: cap the maximum concurrent executions for a function (protects downstream services from being overwhelmed). Provisioned concurrency: pre-warm N environments â€” they're always ready (no cold start), billed per hour even when idle.
+
+**Q335. What is DynamoDB and how does FleetOps use it?**
+DynamoDB is AWS's serverless key-value/document database. FleetOps uses it exclusively as the Terraform state lock table (`fleetops-terraform-locks`). The table has a `LockID` primary key (String). Terraform writes a lock record at the start of plan/apply and deletes it on completion â€” prevents concurrent Terraform operations from corrupting the state file. Not used for application data â€” all application data is in RDS PostgreSQL.
+
+**Q336. What is the ALB connection draining (deregistration delay)?**
+When a target is deregistered from an ALB target group (pod being terminated during rolling update), ALB stops sending new requests to it but continues processing in-flight requests for `deregistration_delay.timeout_seconds` (default 300s, typically set to 30s for fast rolling updates). After the delay, ALB closes connections. The `preStop` hook in the pod spec should sleep for deregistration delay duration to ensure ALB has deregistered before the process exits.
+
+**Q337. What is CloudWatch Logs Insights and how would you use it for FleetOps?**
+CloudWatch Logs Insights: interactive query language for log groups. Example queries:
+- `fields @timestamp, level, message | filter level = "ERROR" | sort @timestamp desc | limit 50` â€” find recent errors.
+- `fields @timestamp, traceId | filter @message like /auth-service/ | stats count(*) by bin(5m)` â€” request rate per 5 minutes.
+- `filter @message like /CRITICAL/ | stats count(*) by bin(1m)` â€” critical alert rate.
+Useful for debugging incidents: correlate timestamps across services by filtering all log groups in a time window.
+
+**Q338. How does Route53 health checking work for failover routing?**
+Route53 can perform HTTP/HTTPS health checks against an endpoint. Failover routing: primary record has an associated health check; if health check fails, Route53 serves the secondary record (failover). FleetOps doesn't implement Route53 failover â€” CloudFront and ALB provide HA. If added: `fleetops.website` primary â†’ CloudFront; secondary â†’ static S3 maintenance page. Health check interval: 30s; failure threshold: 3 consecutive failures.
+
+**Q339. What is AWS GuardDuty and how would it complement FleetOps security?**
+GuardDuty: ML-based threat detection service. Analyzes CloudTrail, VPC Flow Logs, DNS logs. Detects: EC2 instance making DNS queries to known malicious domains (malware C2), unusual IAM API calls from new geolocation (credential theft), cryptocurrency mining activity, port scanning from pods. Not in FleetOps currently â€” adding it would cost ~$4/month for the data volume. Findings trigger CloudWatch Events â†’ SNS alert.
+
+**Q340. How does the ALB handle HTTP to HTTPS redirect?**
+`alb.ingress.kubernetes.io/ssl-redirect: "443"` annotation causes the ALB Ingress Controller to create an HTTP:80 listener with a redirect action to HTTPS:443. Any HTTP request gets a 301 redirect response with `Location: https://...`. The HTTPS:443 listener terminates TLS (ACM cert) and forwards to pods. This is handled entirely at the ALB â€” no application code involved.
+
+---
+
+### SECURITY â€” continued
+
+**Q341. What is the principle of defense in depth?**
+Defense in depth: multiple independent security layers so that breaching one layer doesn't give full access. In FleetOps: (1) WAF filters malicious HTTP patterns, (2) CloudFront origin header (`Host: origin.fleetops.website`) prevents direct ALB access, (3) ALB security group allows only CloudFront IP ranges, (4) Pod security groups restrict pod-to-pod and pod-to-RDS traffic, (5) IRSA limits each pod's AWS permissions, (6) JWT validates user identity, (7) Spring `@PreAuthorize` enforces role-based access, (8) RDS in private subnet with SG. Attacker must breach all layers.
+
+**Q342. What is a penetration test and would you recommend one for FleetOps?**
+A pentest is an authorized simulated attack to find exploitable vulnerabilities before malicious actors do. For a production FleetOps deployment: yes â€” especially before external launch. Scope: web app (OWASP Top 10), API (auth bypass, injection, broken object level auth), infrastructure (exposed ports, SG misconfigurations), container escape (pod privilege escalation). AWS permits pentesting for most services without prior approval, except DDoS simulation (needs explicit approval).
+
+**Q343. How does TLS 1.3 differ from TLS 1.2 and which does CloudFront support?**
+TLS 1.3: fewer round trips (0-RTT or 1-RTT handshake vs 2 in TLS 1.2), removed weak cipher suites (RC4, DES, 3DES, SHA-1), forward secrecy mandatory (ECDHE key exchange always), faster. CloudFront supports TLS 1.3 with `TLSv1.2_2021` security policy (also supports TLS 1.2 for compatibility). FleetOps should use at minimum `TLSv1.2_2021` â€” this drops TLS 1.0 and 1.1 (vulnerable to POODLE, BEAST attacks).
+
+**Q344. What is secrets sprawl and how does ESO help?**
+Secrets sprawl: credentials scattered across config files, environment variables, CI/CD variables, developer laptops, Slack messages. Hard to audit, rotate, or revoke. ESO with Secrets Manager centralizes all secrets: single authoritative source, automatic rotation, CloudTrail audit on every access (who called GetSecretValue, when, from which pod via IRSA role), easy revocation (delete the secret or revoke the IRSA role). K8s Secrets are ephemeral copies â€” the canonical value is always in Secrets Manager.
+
+**Q345. What is image signing and why is it important?**
+Image signing (Sigstore/cosign, Notary): cryptographically signs a container image so consumers can verify it came from a trusted builder and wasn't tampered with. Workflow: CI builds image, signs it with a private key, pushes signature to OCI registry alongside image. Admission controller (policy engine) verifies signature before allowing pod to start. FleetOps doesn't implement image signing â€” a gap to address for production hardening. Without it, a compromised ECR registry could serve malicious images.
+
+---
+
+### PROJECT-SPECIFIC â€” final questions
+
+**Q346. What is the first thing you would do after a successful `terraform apply` to verify the environment is healthy?**
+(1) `kubectl get nodes -n fleetops-prod` â€” verify nodes are Ready, (2) `kubectl get pods -n fleetops-prod` â€” verify all pods Running, (3) `kubectl get pods -n fleetops-system` â€” verify ArgoCD, ESO pods Running, (4) Check ArgoCD UI at argocd.fleetops.website â€” all Applications Synced + Healthy, (5) curl `https://fleetops.website` â€” verify 200 response and frontend loads, (6) curl `https://fleetops.website/api/auth/health` â€” verify backend responds, (7) Check CloudWatch â€” no alarms firing.
+
+**Q347. How would you explain the FleetOps architecture to a non-technical stakeholder?**
+"FleetOps is a web application that manages a vehicle fleet. Users access it via a web browser â€” we use Amazon's global network (CloudFront) to serve the website fast worldwide. The app is split into small, specialized programs (microservices) that run on Amazon's managed Kubernetes service (EKS) â€” like shipping containers for software that can scale up automatically when usage spikes. Data is stored in Amazon's managed database (RDS) so we don't have to manage servers. Everything is automated â€” code changes go through automated testing and deploy themselves without manual steps."
+
+**Q348. What is the biggest technical risk in the current FleetOps architecture?**
+Single RDS instance with no read replica: if it goes down, the entire application loses data persistence â€” all write operations fail. Mitigation priority: (1) Enable Multi-AZ for automatic failover (~2min downtime vs total outage), (2) Add a read replica for vehicle-service and request-service (read-heavy). Second risk: plaintext secrets in `terraform.tfvars` â€” if the file is committed to a public repo, all credentials are exposed. Third risk: no Redis HA â€” cache failure increases RDS load significantly.
+
+**Q349. How does the team collaborate on infrastructure changes?**
+Terraform changes follow the GitOps pattern: (1) Feature branch with Terraform changes, (2) PR triggers `terraform plan` in CI â€” plan output posted as PR comment, (3) Checkov security scan must pass, (4) PR reviewed and approved by a team member, (5) Merge to main triggers `terraform apply` in CI with OIDC credentials. No developer has `terraform apply` permissions on prod directly â€” all changes go through CI. This provides audit trail, review process, and prevents manual drift.
+
+**Q350. What would you change about FleetOps V2 if starting fresh?**
+(1) IRSA for Bedrock from day one â€” no static credentials, (2) Secrets Manager for all sensitive values â€” no plaintext in tfvars, (3) Redis cluster mode with at least one replica â€” HA by default, (4) RDS Multi-AZ enabled from the start â€” the cost is worth the reliability, (5) Image signing with Sigstore/cosign â€” supply chain security, (6) VPC endpoints for ECR/Secrets Manager/S3 â€” eliminate NAT Gateway cost for AWS API calls, (7) Terraform workspaces or separate state per environment â€” cleaner multi-env management, (8) mTLS between pods via service mesh (Linkerd) â€” zero-trust networking.
+
+---
+
+*End of Q166â€“Q350 supplement. Total Q&A count: approximately 350 questions.*
+
